@@ -1,0 +1,41 @@
+Role: Web Developer (Expert in Vanilla JS & Blockchain)
+Objective: Buat aplikasi Crypto Wallet satu halaman (SPA) berbasis browser.
+Constraints:
+No TypeScript: Gunakan .js murni.
+No OOP/Classes: Gunakan fungsi biasa (function atau const = () =>).
+No Modules: Jangan gunakan CDN untuk library. Jangan gunakan import atau export. Semua kode JS harus disimpan di local.
+No Framework: Gunakan HTML, CSS , dan Vanilla JS.
+UI dan UX harus mobile first.
+
+1. Library Setup 
+Ethers.js v6: https://cdnjs.cloudflare.com/ajax/libs/ethers/6.13.2/ethers.umd.min.js
+Bip39 (Browserized): Cari library bip39 yang mendukung browser global (misal via UNPKG atau JSDelivr).
+
+2. Logika Utama (Deterministic Wallet)
+Buat fungsi-fungsi berikut secara berurutan:
+Fungsi generateMnemonicFromPassword(password):
+Gunakan ethers.sha256 atau PBKDF2 untuk mengubah password menjadi entropy 256-bit.
+Gunakan entropy tersebut untuk menghasilkan 24 kata mnemonic via library bip39.
+Pastikan jika password sama, output 24 kata selalu sama.
+Fungsi getHDWallet(mnemonic, index):
+Gunakan path m/44'/60'/0'/0/index.
+Fungsi ini harus mengembalikan Address dan Private Key untuk index yang diminta.
+
+3. Fitur Blockchain (BNB & CELO)
+Buat objek konfigurasi networks yang berisi RPC URL untuk BSC (Binance) dan CELO.
+Fungsi fetchBalance(address, network): Ambil saldo native token menggunakan ethers.JsonRpcProvider.
+Fungsi fetchTransactions(address, network): Gunakan Public API (BscScan/CeloScan) untuk menampilkan history transaksi simpel.
+Fungsi sendToken(to, amount, privateKey, network): Logika untuk mengirim token dengan estimasi gas otomatis.
+
+4. Struktur UI (Satu Halaman)
+Halaman Login: Input password + tombol "Unlock/Create Wallet".
+
+Halaman Dashboard:
+
+Sidebar/List: Tampilkan daftar Address (Index 0 sampai 5 dulu sebagai awal).
+Main View: Tampilkan saldo BNB dan CELO untuk address yang dipilih.
+Tampilkan list transaksi di bawah saldo.
+Tombol "Send" yang membuka Modal/Form sederhana.
+
+5. State Management Simpel
+Gunakan objek global state = { mnemonic: '', currentAddress: '', network: 'BSC' } untuk menyimpan data selama aplikasi terbuka. Jangan simpan mnemonic di LocalStorage.
