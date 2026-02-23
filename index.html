@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="theme-color" content="#0d0f14" />
+  <title>KoinQ — Crypto Wallet</title>
+  <link rel="stylesheet" href="css/style.css" />
+</head>
+<body>
+
+<!-- ===================== TOAST ===================== -->
+<div id="toast-container"></div>
+
+<!-- ===================== LOGIN SCREEN ===================== -->
+<div id="login-screen">
+  <div class="login-card">
+    <div class="login-logo">
+      <span class="logo-icon">🔐</span>
+      <h1>Koin<span>Q</span></h1>
+      <p>Your deterministic crypto wallet</p>
+    </div>
+
+    <div class="login-form">
+      <div>
+        <label for="password-input">Master Password</label>
+        <div class="input-group">
+          <input
+            class="input"
+            id="password-input"
+            type="password"
+            placeholder="Enter your password"
+            autocomplete="current-password"
+          />
+          <button class="input-icon" id="toggle-password" type="button" title="Show/hide password">👁</button>
+        </div>
+      </div>
+
+      <div id="login-error" class="hidden"></div>
+
+      <button class="btn btn-primary w-full" id="unlock-btn" type="button">
+        🔓 Unlock / Create Wallet
+      </button>
+
+      <p class="text-xs text-muted" style="text-align:center; line-height:1.7;">
+        Your wallet is generated from your password using PBKDF2 + BIP39.<br/>
+        The same password always produces the same 24-word seed.<br/>
+        <strong style="color:var(--danger);">⚠ Never share your password. Losing it means losing access to your funds.</strong>
+      </p>
+    </div>
+  </div>
+</div>
+
+<!-- ===================== DASHBOARD SCREEN ===================== -->
+<div id="dashboard-screen" class="hidden">
+
+  <!-- Header -->
+  <header class="dsh-header">
+    <div class="logo">Koin<span>Q</span></div>
+
+    <div class="network-switcher">
+      <button class="net-btn active" data-net="BSC">BNB</button>
+      <button class="net-btn" data-net="CELO">CELO</button>
+    </div>
+
+    <div class="header-actions">
+      <button class="btn btn-ghost" id="refresh-btn" title="Refresh balances">⟳</button>
+      <button class="btn btn-ghost" id="logout-btn" title="Lock wallet">🔒</button>
+    </div>
+  </header>
+
+  <!-- Body -->
+  <div class="dsh-body">
+
+    <!-- Sidebar — wallet list -->
+    <aside class="dsh-sidebar" id="dsh-sidebar">
+      <div class="sidebar-header">
+        <h3>My Wallets</h3>
+      </div>
+      <div class="wallet-list" id="wallet-list"></div>
+    </aside>
+
+    <!-- Main panel -->
+    <main class="dsh-main" id="dsh-main">
+
+      <!-- Back button (mobile only) -->
+      <button class="btn btn-ghost" id="back-btn">← Back</button>
+
+      <!-- Address card -->
+      <div class="address-card">
+        <div class="address-card-header">
+          <h3>Address</h3>
+          <button class="btn btn-ghost" id="copy-address-btn" title="Copy address">📋 Copy</button>
+        </div>
+        <div class="address-full" id="main-address-full">–</div>
+      </div>
+
+      <!-- Balances -->
+      <div class="balance-grid">
+        <div class="balance-card">
+          <div class="chain-label">
+            <span class="chain-dot bnb"></span> BNB Chain
+          </div>
+          <div class="balance-amount" id="balance-bnb">–</div>
+          <div class="balance-symbol">BNB</div>
+        </div>
+        <div class="balance-card">
+          <div class="chain-label">
+            <span class="chain-dot celo"></span> Celo
+          </div>
+          <div class="balance-amount" id="balance-celo">–</div>
+          <div class="balance-symbol">CELO</div>
+        </div>
+      </div>
+
+      <!-- Action bar -->
+      <div class="action-bar">
+        <button class="btn btn-primary" id="send-btn">↑ Send BNB</button>
+      </div>
+
+      <!-- Transactions -->
+      <div class="tx-section">
+        <div class="tx-section-header">
+          <h3>Transactions</h3>
+        </div>
+        <div class="tx-list" id="tx-list">
+          <div class="tx-empty">Select a wallet to view transactions</div>
+        </div>
+      </div>
+
+    </main>
+  </div>
+</div>
+
+<!-- ===================== SEND MODAL ===================== -->
+<div id="send-modal-overlay" class="modal-overlay hidden">
+  <div class="modal">
+    <div class="modal-header">
+      <h3>Send Token</h3>
+      <button class="modal-close" id="send-modal-close">✕</button>
+    </div>
+
+    <div class="modal-form">
+      <div class="form-field">
+        <label for="send-to">Recipient Address</label>
+        <input
+          class="input"
+          id="send-to"
+          type="text"
+          placeholder="0x…"
+          autocomplete="off"
+          spellcheck="false"
+        />
+      </div>
+
+      <div class="form-field">
+        <label for="send-amount">Amount</label>
+        <div class="amount-input-wrap">
+          <input
+            class="input"
+            id="send-amount"
+            type="number"
+            min="0"
+            step="any"
+            placeholder="0.00"
+          />
+          <span class="amount-symbol" id="send-symbol">BNB</span>
+        </div>
+      </div>
+
+      <div class="modal-info">
+        <strong>From:</strong> <span id="modal-from-addr">–</span><br/>
+        Gas fees will be estimated automatically.
+      </div>
+
+      <div id="send-status" class="hidden"></div>
+
+      <button class="btn btn-primary w-full" id="send-confirm-btn">Confirm Send</button>
+    </div>
+  </div>
+</div>
+
+<!-- ===================== LOCAL LIBRARIES ===================== -->
+<script src="js/ethers.umd.min.js"></script>
+<script src="js/app.js"></script>
+
+</body>
+</html>
