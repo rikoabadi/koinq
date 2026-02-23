@@ -508,6 +508,100 @@ function setupRefresh() {
   });
 }
 
+/* ===== Add Wallet ===== */
+function addWallet() {
+  var nextIndex = state.wallets.length;
+  var newWallet = getHDWallet(state.mnemonic, nextIndex);
+  state.wallets.push(newWallet);
+  renderSidebar();
+  showToast('Account ' + nextIndex + ' added', 'success');
+}
+
+function setupAddWallet() {
+  $('add-wallet-fab').addEventListener('click', function() {
+    if (!state.mnemonic) return;
+    addWallet();
+  });
+}
+
+/* ===== Copy Phrase Modal ===== */
+function setupPhraseModal() {
+  var copyPhraseBtn  = $('copy-phrase-btn');
+  var overlay        = $('phrase-modal-overlay');
+  var closeBtn       = $('phrase-modal-close');
+  var confirmBtn     = $('phrase-confirm-btn');
+  var pwdInput       = $('phrase-pwd-input');
+  var toggleBtn      = $('phrase-toggle-pwd');
+  var statusEl       = $('phrase-status');
+
+  function openModal() {
+    pwdInput.value = '';
+    statusEl.className = 'hidden';
+    statusEl.textContent = '';
+    overlay.classList.remove('hidden');
+    pwdInput.focus();
+  }
+
+  function closeModal() {
+    overlay.classList.add('hidden');
+    pwdInput.value = '';
+    statusEl.className = 'hidden';
+  }
+
+  copyPhraseBtn.addEventListener('click', function() {
+    if (!state.mnemonic) return;
+    openModal();
+  });
+
+  closeBtn.addEventListener('click', closeModal);
+  overlay.addEventListener('click', function(e) {
+    if (e.target === overlay) closeModal();
+  });
+
+  toggleBtn.addEventListener('click', function() {
+    var isText = pwdInput.type === 'text';
+    pwdInput.type = isText ? 'password' : 'text';
+    toggleBtn.textContent = isText ? '👁' : '🙈';
+  });
+
+  pwdInput.addEventListener('keydown', function(e) {
+    if (e.key === 'Enter') confirmBtn.click();
+  });
+
+  confirmBtn.addEventListener('click', async function() {
+    var pwd = pwdInput.value;
+    if (!pwd) {
+      setStatus(statusEl, 'error', '✗ Please enter your password.');
+      return;
+    }
+
+    confirmBtn.disabled = true;
+    confirmBtn.innerHTML = '<span class="spinner"></span> Verifying…';
+
+    try {
+      var derivedMnemonic = await generateMnemonicFromPassword(pwd);
+      if (derivedMnemonic === state.mnemonic) {
+        navigator.clipboard.writeText(state.mnemonic).then(function() {
+          setStatus(statusEl, 'success', '✓ Recovery phrase copied to clipboard!');
+          showToast('Recovery phrase copied to clipboard', 'success');
+          setTimeout(closeModal, 2000);
+        }).catch(function() {
+          setStatus(statusEl, 'error', '✗ Clipboard access denied. Please allow clipboard permissions.');
+        });
+      } else {
+        setStatus(statusEl, 'error', '✗ Incorrect password. Please try again.');
+        pwdInput.value = '';
+        pwdInput.focus();
+      }
+    } catch (err) {
+      setStatus(statusEl, 'error', '✗ Error verifying password.');
+    }
+
+    confirmBtn.disabled = false;
+    confirmBtn.innerHTML = '📋 Copy Phrase to Clipboard';
+  });
+}
+
 /* ===== Init ===== */
 function init() {
   setupLogin();
@@ -517,6 +611,8 @@ function init() {
   setupLogout();
   setupCopyAddress();
   setupRefresh();
+  setupAddWallet();
+  setupPhraseModal();
   showScreen('login-screen');
 }
 
