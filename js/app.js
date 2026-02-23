@@ -3,13 +3,52 @@
    Vanilla JS, No TypeScript, No OOP, No Modules
    =================================================== */
 
+/* ===== HTTPS Enforcement ===== */
+if (location.protocol !== 'https:' &&
+    location.hostname !== 'localhost' &&
+    location.hostname !== '127.0.0.1') {
+  location.replace('https:' + location.href.substring(location.protocol.length));
+}
+
+/* ===== Session Encryption ===== */
+var sessionEncKey = null; // CryptoKey for AES-GCM (never leaves memory as raw bytes)
+
+async function initSessionKey(password) {
+  var salt = crypto.getRandomValues(new Uint8Array(16));
+  var encoder = new TextEncoder();
+  var km = await crypto.subtle.importKey(
+    'raw', encoder.encode(password), 'PBKDF2', false, ['deriveKey']
+  );
+  sessionEncKey = await crypto.subtle.deriveKey(
+    { name: 'PBKDF2', salt: salt, iterations: 200000, hash: 'SHA-256' },
+    km,
+    { name: 'AES-GCM', length: 256 },
+    false,
+    ['encrypt', 'decrypt']
+  );
+}
+
+async function encryptStr(str) {
+  var iv = crypto.getRandomValues(new Uint8Array(12));
+  var data = new TextEncoder().encode(str);
+  var ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv: iv }, sessionEncKey, data);
+  return { iv: Array.from(iv), ct: Array.from(new Uint8Array(ct)) };
+}
+
+async function decryptStr(enc) {
+  var iv = new Uint8Array(enc.iv);
+  var ct = new Uint8Array(enc.ct);
+  var pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: iv }, sessionEncKey, ct);
+  return new TextDecoder().decode(pt);
+}
+
 /* ===== State ===== */
 var state = {
-  mnemonic: '',
+  encryptedMnemonic: null, // {iv, ct} – AES-GCM encrypted, never stored as plain text
   currentIndex: 0,
   currentAddress: '',
   network: 'BSC',
-  wallets: [],        // [{address, privateKey}, ...]
+  wallets: [],        // [{address, encryptedPrivateKey: {iv, ct}}, ...]
   balanceBSC: {},     // {address: '0.0'}
   balanceCELO: {},    // {address: '0.0'}
   balanceUSDT: {},    // {address_NETWORK: '0.0'}
@@ -63,7 +102,7 @@ async function generateMnemonicFromPassword(password) {
     ['deriveBits']
   );
   var bits = await crypto.subtle.deriveBits(
-    { name: 'PBKDF2', salt: salt, iterations: 100000, hash: 'SHA-256' },
+    { name: 'PBKDF2', salt: salt, iterations: 200000, hash: 'SHA-256' },
     keyMaterial,
     256
   );
@@ -130,10 +169,12 @@ async function estimateUSDTTransfer(to, amount, fromAddress, network) {
 }
 
 // Send USDT via ERC-20 transfer
-async function sendUSDT(to, amountWei, privateKey, network, gasPrice) {
+async function sendUSDT(to, amountWei, encryptedPrivateKey, network, gasPrice) {
+  var privateKey = await decryptStr(encryptedPrivateKey);
   var cfg = networks[network];
   var provider = new ethers.JsonRpcProvider(cfg.rpcUrl);
   var wallet = new ethers.Wallet(privateKey, provider);
+  privateKey = null; // Clear local reference once Wallet object is created
   var contract = new ethers.Contract(cfg.usdtAddress, ERC20_ABI, wallet);
   var tx = await contract.transfer(to, amountWei, { gasPrice: gasPrice });
   return tx;
@@ -143,9 +184,9 @@ async function sendUSDT(to, amountWei, privateKey, network, gasPrice) {
 async function fetchTransactions(address, network) {
   try {
     var api = networks[network].explorerApi;
-    var url = api + '?module=account&action=txlist&address=' + address +
+    var url = api + '?module=account&action=txlist&address=' + encodeURIComponent(address) +
               '&startblock=0&endblock=99999999&page=1&offset=10&sort=desc';
-    var res = await fetch(url);
+    var res = await fetch(url, { mode: 'cors', credentials: 'omit' });
     var data = await res.json();
     if (data.status === '1' && Array.isArray(data.result)) return data.result;
     return [];
@@ -223,17 +264,27 @@ function setupLogin() {
 
     errEl.classList.add('hidden');
     unlockBtn.disabled = true;
-    unlockBtn.innerHTML = '<span class="spinner"></span> Generating wallet…';
+    unlockBtn.textContent = '';
+    var sp = document.createElement('span');
+    sp.className = 'spinner';
+    unlockBtn.appendChild(sp);
+    unlockBtn.appendChild(document.createTextNode(' Generating wallet…'));
 
     try {
+      await initSessionKey(pwd);
       var mnemonic = await generateMnemonicFromPassword(pwd);
-      state.mnemonic = mnemonic;
+      state.encryptedMnemonic = await encryptStr(mnemonic);
 
       // Derive wallets 0–5
       state.wallets = [];
       for (var i = 0; i < 6; i++) {
-        state.wallets.push(getHDWallet(mnemonic, i));
+        var w = getHDWallet(mnemonic, i);
+        state.wallets.push({
+          address: w.address,
+          encryptedPrivateKey: await encryptStr(w.privateKey)
+        });
       }
+      mnemonic = null;
 
       state.currentIndex = 0;
       state.currentAddress = state.wallets[0].address;
@@ -247,11 +298,11 @@ function setupLogin() {
       }
       loadAddressData(state.currentAddress);
     } catch (err) {
-      showError(errEl, 'Error generating wallet: ' + err.message);
+      showError(errEl, 'Error generating wallet. Please try again.');
     }
 
     unlockBtn.disabled = false;
-    unlockBtn.innerHTML = '🔓 Unlock / Create Wallet';
+    unlockBtn.textContent = '🔓 Unlock / Create Wallet';
   });
 }
 
@@ -398,16 +449,26 @@ function renderTransactions() {
   var net  = state.network;
 
   if (state.txLoading) {
-    list.innerHTML = '<div class="tx-loading"><span class="spinner"></span></div>';
+    list.textContent = '';
+    var loadingDiv = document.createElement('div');
+    loadingDiv.className = 'tx-loading';
+    var spinnerEl = document.createElement('span');
+    spinnerEl.className = 'spinner';
+    loadingDiv.appendChild(spinnerEl);
+    list.appendChild(loadingDiv);
     return;
   }
 
   if (!state.transactions || state.transactions.length === 0) {
-    list.innerHTML = '<div class="tx-empty">No transactions found</div>';
+    list.textContent = '';
+    var emptyDiv = document.createElement('div');
+    emptyDiv.className = 'tx-empty';
+    emptyDiv.textContent = 'No transactions found';
+    list.appendChild(emptyDiv);
     return;
   }
 
-  list.innerHTML = '';
+  list.textContent = '';
   state.transactions.forEach(function(tx) {
     var isIn = tx.to && tx.to.toLowerCase() === addr.toLowerCase();
     var direction = isIn ? 'in' : 'out';
@@ -416,22 +477,49 @@ function renderTransactions() {
     var amountEth = ethers.formatEther(tx.value || '0');
     var amountFmt = formatAmount(amountEth);
     var sym       = networks[net].symbol;
-    var explorerUrl = networks[net].explorerTx + tx.hash;
+    var explorerUrl = networks[net].explorerTx + encodeURIComponent(tx.hash);
 
     var item = document.createElement('div');
     item.className = 'tx-item';
-    item.innerHTML =
-      '<div class="tx-icon ' + direction + '">' + dirIcon + '</div>' +
-      '<div class="tx-info">' +
-        '<div class="tx-type">' + dirLabel + '</div>' +
-        '<a class="tx-hash" href="' + explorerUrl + '" target="_blank" rel="noopener noreferrer">' + tx.hash.slice(0, 20) + '…</a>' +
-      '</div>' +
-      '<div class="tx-right">' +
-        '<div class="tx-amount ' + (isIn ? 'text-green' : 'text-danger') + '">' +
-          (isIn ? '+' : '-') + amountFmt + ' ' + sym +
-        '</div>' +
-        '<div class="tx-time">' + timeAgo(tx.timeStamp) + '</div>' +
-      '</div>';
+
+    var iconEl = document.createElement('div');
+    iconEl.className = 'tx-icon ' + direction;
+    iconEl.textContent = dirIcon;
+
+    var infoEl = document.createElement('div');
+    infoEl.className = 'tx-info';
+
+    var typeEl = document.createElement('div');
+    typeEl.className = 'tx-type';
+    typeEl.textContent = dirLabel;
+
+    var hashEl = document.createElement('a');
+    hashEl.className = 'tx-hash';
+    hashEl.href = explorerUrl;
+    hashEl.target = '_blank';
+    hashEl.rel = 'noopener noreferrer';
+    hashEl.textContent = tx.hash.slice(0, 20) + '…';
+
+    infoEl.appendChild(typeEl);
+    infoEl.appendChild(hashEl);
+
+    var rightEl = document.createElement('div');
+    rightEl.className = 'tx-right';
+
+    var amountEl = document.createElement('div');
+    amountEl.className = 'tx-amount ' + (isIn ? 'text-green' : 'text-danger');
+    amountEl.textContent = (isIn ? '+' : '-') + amountFmt + ' ' + sym;
+
+    var timeEl = document.createElement('div');
+    timeEl.className = 'tx-time';
+    timeEl.textContent = timeAgo(tx.timeStamp);
+
+    rightEl.appendChild(amountEl);
+    rightEl.appendChild(timeEl);
+
+    item.appendChild(iconEl);
+    item.appendChild(infoEl);
+    item.appendChild(rightEl);
 
     list.appendChild(item);
   });
@@ -601,7 +689,13 @@ function setupSendModal() {
     }
 
     dryRunBtn.disabled = true;
-    setStatus(statusEl, 'info', '<span class="spinner"></span> Simulating transfer…');
+    statusEl.className = 'modal-info info';
+    statusEl.textContent = '';
+    var spDry = document.createElement('span');
+    spDry.className = 'spinner';
+    statusEl.appendChild(spDry);
+    statusEl.appendChild(document.createTextNode(' Simulating transfer…'));
+    statusEl.classList.remove('hidden');
 
     try {
       var est = await estimateUSDTTransfer(to, amount, wallet.address, net);
@@ -645,7 +739,7 @@ function setupSendModal() {
       showStep('preview');
       statusEl.classList.add('hidden');
     } catch (err) {
-      var msg = err.reason || err.message || 'Simulation failed. Check balance or address.';
+      var msg = err.reason || 'Simulation failed. Check balance or address.';
       setStatus(statusEl, 'error', '✗ ' + msg.slice(0, 120));
     }
 
@@ -658,10 +752,16 @@ function setupSendModal() {
 
     var wallet = state.wallets[state.currentIndex];
     confirmBtn.disabled = true;
-    setStatus(statusPreview, 'info', '<span class="spinner"></span> Sending USDT…');
+    statusPreview.className = 'modal-info info';
+    statusPreview.textContent = '';
+    var spSend = document.createElement('span');
+    spSend.className = 'spinner';
+    statusPreview.appendChild(spSend);
+    statusPreview.appendChild(document.createTextNode(' Sending USDT…'));
+    statusPreview.classList.remove('hidden');
 
     try {
-      var tx = await sendUSDT(pendingTx.to, pendingTx.amountWei, wallet.privateKey, pendingTx.network, pendingTx.gasPrice);
+      var tx = await sendUSDT(pendingTx.to, pendingTx.amountWei, wallet.encryptedPrivateKey, pendingTx.network, pendingTx.gasPrice);
       setStatus(statusPreview, 'success', '✓ Sent! TX: ' + tx.hash.slice(0, 18) + '…');
       showToast('USDT sent successfully!', 'success');
       setTimeout(function() {
@@ -669,7 +769,7 @@ function setupSendModal() {
         loadAddressData(state.currentAddress);
       }, 2500);
     } catch (err) {
-      var msg = err.reason || err.message || 'Transaction failed. Check your USDT and gas balance.';
+      var msg = err.reason || 'Transaction failed. Check your USDT and gas balance.';
       setStatus(statusPreview, 'error', '✗ ' + msg.slice(0, 120));
     }
 
@@ -677,9 +777,9 @@ function setupSendModal() {
   });
 }
 
-function setStatus(el, type, html) {
+function setStatus(el, type, msg) {
   el.className = 'modal-info ' + type;
-  el.innerHTML = html;
+  el.textContent = msg;
   el.classList.remove('hidden');
 }
 
@@ -696,13 +796,14 @@ function setupBackBtn() {
 /* ===== Logout ===== */
 function setupLogout() {
   $('logout-btn').addEventListener('click', function() {
-    state.mnemonic = '';
+    state.encryptedMnemonic = null;
     state.wallets  = [];
     state.currentAddress = '';
     state.transactions = [];
     state.balanceBSC  = {};
     state.balanceCELO = {};
     state.balanceUSDT = {};
+    sessionEncKey = null;
     $('password-input').value = '';
     $('login-error').classList.add('hidden');
     showScreen('login-screen');
@@ -726,17 +827,23 @@ function setupRefresh() {
 }
 
 /* ===== Add Wallet ===== */
-function addWallet() {
+async function addWallet() {
   var nextIndex = state.wallets.length;
-  var newWallet = getHDWallet(state.mnemonic, nextIndex);
-  state.wallets.push(newWallet);
+  var mnemonic = await decryptStr(state.encryptedMnemonic);
+  var newWallet = getHDWallet(mnemonic, nextIndex);
+  mnemonic = null;
+  state.wallets.push({
+    address: newWallet.address,
+    encryptedPrivateKey: await encryptStr(newWallet.privateKey)
+  });
+  newWallet.privateKey = null;
   renderSidebar();
   showToast('Account ' + nextIndex + ' added', 'success');
 }
 
 function setupAddWallet() {
   $('add-wallet-fab').addEventListener('click', function() {
-    if (!state.mnemonic) return;
+    if (!state.encryptedMnemonic) return;
     addWallet();
   });
 }
@@ -766,7 +873,7 @@ function setupPhraseModal() {
   }
 
   copyPhraseBtn.addEventListener('click', function() {
-    if (!state.mnemonic) return;
+    if (!state.encryptedMnemonic) return;
     openModal();
   });
 
@@ -793,12 +900,17 @@ function setupPhraseModal() {
     }
 
     confirmBtn.disabled = true;
-    confirmBtn.innerHTML = '<span class="spinner"></span> Verifying…';
+    confirmBtn.textContent = '';
+    var sp = document.createElement('span');
+    sp.className = 'spinner';
+    confirmBtn.appendChild(sp);
+    confirmBtn.appendChild(document.createTextNode(' Verifying…'));
 
     try {
       var derivedMnemonic = await generateMnemonicFromPassword(pwd);
-      if (derivedMnemonic === state.mnemonic) {
-        navigator.clipboard.writeText(state.mnemonic).then(function() {
+      var storedMnemonic = await decryptStr(state.encryptedMnemonic);
+      if (derivedMnemonic === storedMnemonic) {
+        navigator.clipboard.writeText(storedMnemonic).then(function() {
           setStatus(statusEl, 'success', '✓ Recovery phrase copied to clipboard!');
           showToast('Recovery phrase copied to clipboard', 'success');
           setTimeout(closeModal, 2000);
@@ -812,10 +924,13 @@ function setupPhraseModal() {
       }
     } catch (err) {
       setStatus(statusEl, 'error', '✗ Error verifying password.');
+    } finally {
+      storedMnemonic = null;
+      derivedMnemonic = null;
     }
 
     confirmBtn.disabled = false;
-    confirmBtn.innerHTML = '📋 Copy Phrase to Clipboard';
+    confirmBtn.textContent = '📋 Copy Phrase to Clipboard';
   });
 }
 
