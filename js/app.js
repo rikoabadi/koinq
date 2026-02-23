@@ -10,6 +10,39 @@ if (location.protocol === 'http:' &&
   location.replace('https:' + location.href.substring(location.protocol.length));
 }
 
+/* ===== Brute-force Protection ===== */
+var unlockAttemptCount = 0;
+var unlockCooldownUntil = 0;
+var unlockCooldownTimer = null;
+
+// Returns cooldown duration in ms based on number of prior attempts
+function getUnlockCooldownMs(attempts) {
+  if (attempts <= 1) return 0;
+  // 5s, 15s, 45s, 60s … capped at 60 s
+  return Math.min(5 * Math.pow(3, attempts - 2), 60) * 1000;
+}
+
+// Starts an interval that counts down and re-enables the button when done
+function startUnlockCooldown(errEl, unlockBtn) {
+  clearInterval(unlockCooldownTimer);
+  unlockBtn.disabled = true;
+  function tick() {
+    var remaining = Math.ceil((unlockCooldownUntil - Date.now()) / 1000);
+    if (remaining <= 0) {
+      clearInterval(unlockCooldownTimer);
+      errEl.classList.add('hidden');
+      unlockBtn.disabled = false;
+      unlockBtn.textContent = '🔓 Unlock / Create Wallet';
+      return;
+    }
+    errEl.textContent = '🔒 Too many attempts. Please wait ' + remaining + 's…';
+    errEl.classList.remove('hidden');
+    unlockBtn.textContent = '⏳ Wait ' + remaining + 's…';
+  }
+  tick();
+  unlockCooldownTimer = setInterval(tick, 500);
+}
+
 /* ===== Session Encryption ===== */
 var sessionEncKey = null; // CryptoKey for AES-GCM (never leaves memory as raw bytes)
 
@@ -102,7 +135,7 @@ async function generateMnemonicFromPassword(password) {
     ['deriveBits']
   );
   var bits = await crypto.subtle.deriveBits(
-    { name: 'PBKDF2', salt: salt, iterations: 200000, hash: 'SHA-256' },
+    { name: 'PBKDF2', salt: salt, iterations: 600000, hash: 'SHA-256' },
     keyMaterial,
     256
   );
@@ -258,6 +291,12 @@ function setupLogin() {
   });
 
   unlockBtn.addEventListener('click', async function() {
+    // Enforce cooldown between unlock attempts
+    if (Date.now() < unlockCooldownUntil) {
+      startUnlockCooldown(errEl, unlockBtn);
+      return;
+    }
+
     var pwd = pwdInput.value.trim();
     if (!pwd) { showError(errEl, 'Please enter a password.'); return; }
     if (pwd.length < 6) { showError(errEl, 'Password must be at least 6 characters.'); return; }
@@ -280,7 +319,18 @@ function setupLogin() {
     var sp = document.createElement('span');
     sp.className = 'spinner';
     unlockBtn.appendChild(sp);
-    unlockBtn.appendChild(document.createTextNode(' Generating wallet…'));
+    unlockBtn.appendChild(document.createTextNode(' Computing wallet (brute-force protected)…'));
+
+    // Count this attempt and set the next cooldown window.
+    // Note: the counter is intentionally NOT reset on "successful" unlock because
+    // in this app every password produces a valid wallet (there is no wrong password).
+    // Resetting on success would let an attacker bypass the cooldown by simply
+    // cycling through passwords — each one would "succeed" at the UI level.
+    unlockAttemptCount++;
+    var cooldownMs = getUnlockCooldownMs(unlockAttemptCount);
+    if (cooldownMs > 0) {
+      unlockCooldownUntil = Date.now() + cooldownMs;
+    }
 
     var mnemonic = null;
     try {
@@ -313,8 +363,12 @@ function setupLogin() {
       showError(errEl, 'Error generating wallet: ' + (err && err.message ? err.message : 'Please try again.'));
     } finally {
       mnemonic = null;
-      unlockBtn.disabled = false;
-      unlockBtn.textContent = '🔓 Unlock / Create Wallet';
+      if (cooldownMs > 0) {
+        startUnlockCooldown(errEl, unlockBtn);
+      } else {
+        unlockBtn.disabled = false;
+        unlockBtn.textContent = '🔓 Unlock / Create Wallet';
+      }
     }
   });
 }
