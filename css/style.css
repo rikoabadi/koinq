@@ -314,6 +314,53 @@ html, body {
 }
 .file-drop-note strong { color: var(--danger); }
 
+/* ===== Key File Tabs ===== */
+.keyfile-tabs {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 10px;
+}
+.kf-tab {
+  flex: 1;
+  padding: 8px 10px;
+  font-size: 12px;
+  font-weight: 600;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg3);
+  color: var(--text2);
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
+}
+.kf-tab.active {
+  background: var(--accent);
+  color: #000;
+  border-color: var(--accent);
+}
+.kf-tab:not(.active):hover {
+  background: var(--border);
+  color: var(--text);
+}
+
+.btn-copy-hash {
+  margin-top: 8px;
+  width: 100%;
+  font-size: 12px;
+  padding: 7px 12px;
+}
+.btn-copy-hash.hidden { display: none; }
+
+.hash-hint-msg {
+  font-size: 11px;
+  margin-top: 6px;
+  min-height: 16px;
+  font-family: monospace;
+  word-break: break-all;
+  line-height: 1.5;
+}
+.hash-hint-msg.valid   { color: var(--accent2); }
+.hash-hint-msg.invalid { color: var(--danger); }
+
 /* ===== Dashboard ===== */
 #dashboard-screen {
   min-height: 100vh;

@@ -38,26 +38,56 @@
         </div>
       </div>
 
-      <!-- Step 2: Key File -->
+      <!-- Step 2: Key File -->  
       <div>
-        <label>② Key File <span class="text-muted" style="font-weight:400;">(ZIP / any file)</span></label>
-        <div class="file-drop-zone" id="file-drop-zone">
-          <input type="file" id="key-file-input" class="file-input-hidden" accept="*/*" />
-          <div class="file-drop-content" id="file-drop-content">
-            <span class="file-drop-icon">📁</span>
-            <span class="file-drop-text">Drop file here or <u>click to browse</u></span>
-            <span class="file-drop-hint">Any file — ZIP, image, PDF, etc.</span>
-          </div>
-          <div class="file-selected" id="file-selected-info" style="display:none;">
-            <span class="file-sel-icon">✅</span>
-            <div class="file-sel-detail">
-              <div class="file-sel-name" id="file-sel-name">–</div>
-              <div class="file-sel-hash" id="file-sel-hash">Hashing…</div>
-            </div>
-            <button class="file-sel-clear" id="file-clear-btn" title="Remove file">✕</button>
-          </div>
+        <label>② Key File Hash</label>
+
+        <!-- Tab toggle -->
+        <div class="keyfile-tabs" id="keyfile-tabs">
+          <button class="kf-tab active" id="tab-upload" type="button">📁 Upload File</button>
+          <button class="kf-tab" id="tab-manual" type="button">✏️ Input Hash</button>
         </div>
-        <p class="file-drop-note">⚠ Keep this file safe. Without it, your wallet <strong>cannot be recovered</strong>.</p>
+
+        <!-- Panel: Upload File -->
+        <div id="panel-upload">
+          <div class="file-drop-zone" id="file-drop-zone">
+            <input type="file" id="key-file-input" class="file-input-hidden" accept="*/*" />
+            <div class="file-drop-content" id="file-drop-content">
+              <span class="file-drop-icon">📁</span>
+              <span class="file-drop-text">Drop file here or <u>click to browse</u></span>
+              <span class="file-drop-hint">Any file — ZIP, image, PDF, etc.</span>
+            </div>
+            <div class="file-selected" id="file-selected-info" style="display:none;">
+              <span class="file-sel-icon">✅</span>
+              <div class="file-sel-detail">
+                <div class="file-sel-name" id="file-sel-name">–</div>
+                <div class="file-sel-hash" id="file-sel-hash">Hashing…</div>
+              </div>
+              <button class="file-sel-clear" id="file-clear-btn" title="Remove file">✕</button>
+            </div>
+          </div>
+          <!-- Copy hash button (muncul setelah file dipilih) -->
+          <button class="btn btn-secondary btn-copy-hash hidden" id="copy-hash-btn" type="button">📋 Copy Hash</button>
+        </div>
+
+        <!-- Panel: Input Hash Manual -->
+        <div id="panel-manual" style="display:none;">
+          <div class="input-group">
+            <input
+              class="input"
+              id="manual-hash-input"
+              type="text"
+              placeholder="Paste SHA-256 hash here (64 hex chars)"
+              autocomplete="off"
+              spellcheck="false"
+              maxlength="64"
+            />
+            <button class="input-icon" id="clear-manual-hash" type="button" title="Clear">✕</button>
+          </div>
+          <div id="manual-hash-hint" class="hash-hint-msg"></div>
+        </div>
+
+        <p class="file-drop-note">⚠ Keep this file (or its hash) safe. Without it, your wallet <strong>cannot be recovered</strong>.</p>
       </div>
 
       <div id="login-error" class="hidden"></div>

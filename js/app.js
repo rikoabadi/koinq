@@ -327,8 +327,37 @@ function setupLogin() {
   var selName    = $('file-sel-name');
   var selHash    = $('file-sel-hash');
   var clearBtn   = $('file-clear-btn');
+  var copyHashBtn   = $('copy-hash-btn');
+  var tabUpload  = $('tab-upload');
+  var tabManual  = $('tab-manual');
+  var panelUpload = $('panel-upload');
+  var panelManual = $('panel-manual');
+  var manualInput = $('manual-hash-input');
+  var clearManualBtn = $('clear-manual-hash');
+  var manualHint = $('manual-hash-hint');
 
-  var selectedFileHash = null; // SHA-256 hex of the key file
+  var selectedFileHash = null;  // dari upload
+  var activeTab = 'upload';     // 'upload' | 'manual'
+
+  // --- Tab switching ---
+  function switchTab(tab) {
+    activeTab = tab;
+    if (tab === 'upload') {
+      tabUpload.classList.add('active');
+      tabManual.classList.remove('active');
+      panelUpload.style.display = 'block';
+      panelManual.style.display = 'none';
+    } else {
+      tabManual.classList.add('active');
+      tabUpload.classList.remove('active');
+      panelManual.style.display = 'block';
+      panelUpload.style.display = 'none';
+    }
+    errEl.classList.add('hidden');
+  }
+
+  tabUpload.addEventListener('click', function() { switchTab('upload'); });
+  tabManual.addEventListener('click', function() { switchTab('manual'); });
 
   // --- File selection handler ---
   function handleFile(file) {
@@ -337,12 +366,15 @@ function setupLogin() {
     selHash.textContent = 'Hashing…';
     dropContent.style.display = 'none';
     selectedInfo.style.display = 'flex';
+    copyHashBtn.classList.add('hidden');
     selectedFileHash = null;
     hashFile(file).then(function(hex) {
       selectedFileHash = hex;
       selHash.textContent = 'SHA-256: ' + hex.slice(0, 16) + '…' + hex.slice(-8);
+      copyHashBtn.classList.remove('hidden');
     }).catch(function() {
       selHash.textContent = 'Hashing failed — try another file';
+      copyHashBtn.classList.add('hidden');
     });
   }
 
@@ -366,15 +398,53 @@ function setupLogin() {
   });
 
   // Clear file button
-  clearBtn.addEventListener('click', function(e) {
-    e.stopPropagation();
-    e.preventDefault();
+  function clearFileSelection() {
     selectedFileHash = null;
     fileInput.value = '';
     selectedInfo.style.display = 'none';
     dropContent.style.display = 'flex';
+    copyHashBtn.classList.add('hidden');
     selName.textContent = '–';
     selHash.textContent = 'Hashing…';
+  }
+  clearBtn.addEventListener('click', function(e) {
+    e.stopPropagation();
+    e.preventDefault();
+    clearFileSelection();
+  });
+
+  // Copy hash button
+  copyHashBtn.addEventListener('click', function(e) {
+    e.stopPropagation();
+    e.preventDefault();
+    if (!selectedFileHash) return;
+    navigator.clipboard.writeText(selectedFileHash).then(function() {
+      showToast('Hash copied to clipboard!', 'success');
+    }).catch(function() {
+      showToast('Copy failed — try manually selecting the hash text.', 'error');
+    });
+  });
+
+  // --- Manual hash input validation ---
+  var HEX64_RE = /^[0-9a-fA-F]{64}$/;
+  manualInput.addEventListener('input', function() {
+    var val = manualInput.value.trim();
+    if (val.length === 0) {
+      manualHint.textContent = '';
+      manualHint.className = 'hash-hint-msg';
+    } else if (HEX64_RE.test(val)) {
+      manualHint.textContent = '✓ Valid SHA-256 hash (' + val.slice(0,8) + '…' + val.slice(-8) + ')';
+      manualHint.className = 'hash-hint-msg valid';
+    } else {
+      manualHint.textContent = '✗ Must be exactly 64 hex characters (' + val.length + '/64)';
+      manualHint.className = 'hash-hint-msg invalid';
+    }
+  });
+
+  clearManualBtn.addEventListener('click', function() {
+    manualInput.value = '';
+    manualHint.textContent = '';
+    manualHint.className = 'hash-hint-msg';
   });
 
   toggleBtn.addEventListener('click', function() {
@@ -405,7 +475,35 @@ function setupLogin() {
     var pwd = pwdInput.value.trim();
     if (!pwd) { showError(errEl, 'Please enter a password.'); return; }
     if (pwd.length < 6) { showError(errEl, 'Password must be at least 6 characters.'); return; }
-    if (!selectedFileHash) { showError(errEl, 'Please select a Key File before unlocking.'); return; }
+
+    // --- Resolve key file hash dari salah satu sumber ---
+    var manualVal = manualInput.value.trim().toLowerCase();
+    var hasFile   = activeTab === 'upload' && !!selectedFileHash;
+    var hasManual = activeTab === 'manual' && HEX64_RE.test(manualVal);
+
+    // Konflik: user mengisi keduanya (tab upload ada file, tab manual ada isi)
+    // Tangkap edge-case: user switch tab tanpa clear
+    var bothFilled = !!selectedFileHash && HEX64_RE.test(manualVal);
+    if (bothFilled) {
+      // Reset keduanya dan beri notifikasi
+      clearFileSelection();
+      manualInput.value = '';
+      manualHint.textContent = '';
+      manualHint.className = 'hash-hint-msg';
+      switchTab('upload');
+      showError(errEl, '⚠️ Hanya boleh pilih satu: Upload File atau Input Hash. Keduanya telah direset, silakan ulangi.');
+      return;
+    }
+
+    var finalHash = hasFile ? selectedFileHash : (hasManual ? manualVal : null);
+    if (!finalHash) {
+      if (activeTab === 'upload') {
+        showError(errEl, 'Please upload a Key File, or switch to “Input Hash” tab to enter the hash manually.');
+      } else {
+        showError(errEl, 'Please enter a valid 64-character SHA-256 hash.');
+      }
+      return;
+    }
 
     // Check for secure context (crypto.subtle requires HTTPS or localhost)
     if (!crypto.subtle) {
@@ -445,7 +543,7 @@ function setupLogin() {
     try {
       // Combined secret: "koinq:v2:" + masterPassword + ":" + SHA-256 hex of key file
       // Attacker needs BOTH the password AND the exact file to reproduce the mnemonic.
-      var combinedSecret = 'koinq:v2:' + pwd + ':' + selectedFileHash;
+      var combinedSecret = 'koinq:v2:' + pwd + ':' + finalHash;
       await initSessionKey(combinedSecret);
       mnemonic = await generateMnemonicFromPassword(combinedSecret);
       combinedSecret = null; // clear reference immediately
@@ -993,6 +1091,17 @@ function setupLogout() {
     var dropContent = $('file-drop-content');
     if (selInfo) selInfo.style.display = 'none';
     if (dropContent) dropContent.style.display = 'flex';
+    var copyHBtn = $('copy-hash-btn');
+    if (copyHBtn) copyHBtn.classList.add('hidden');
+    var manualInp = $('manual-hash-input');
+    if (manualInp) manualInp.value = '';
+    var manualHnt = $('manual-hash-hint');
+    if (manualHnt) { manualHnt.textContent = ''; manualHnt.className = 'hash-hint-msg'; }
+    // Reset ke tab upload
+    var tabUp = $('tab-upload'); var tabMn = $('tab-manual');
+    var panUp = $('panel-upload'); var panMn = $('panel-manual');
+    if (tabUp && tabMn) { tabUp.classList.add('active'); tabMn.classList.remove('active'); }
+    if (panUp && panMn) { panUp.style.display = 'block'; panMn.style.display = 'none'; }
     showScreen('login-screen');
   });
 }
