@@ -11,33 +11,62 @@ if (location.protocol === 'http:' &&
 }
 
 /* ===== Brute-force Protection ===== */
-var unlockAttemptCount = 0;
-var unlockCooldownUntil = 0;
+var BF_STORAGE_KEY = 'koinq_bf';
+var BF_MAX_ATTEMPTS = 10;          // lockout permanen setelah 10x gagal
+var BF_PERM_LOCKOUT_MS = 24 * 60 * 60 * 1000; // 24 jam
 var unlockCooldownTimer = null;
 
-// Returns cooldown duration in ms based on number of prior attempts
-function getUnlockCooldownMs(attempts) {
-  if (attempts <= 1) return 0;
-  // 5s, 15s, 45s, 60s … capped at 60 s
-  return Math.min(5 * Math.pow(3, attempts - 2), 60) * 1000;
+// Baca state dari localStorage agar persist saat refresh
+function bfLoad() {
+  try {
+    var raw = localStorage.getItem(BF_STORAGE_KEY);
+    if (raw) return JSON.parse(raw);
+  } catch (e) {}
+  return { attempts: 0, cooldownUntil: 0, lockedUntil: 0 };
 }
 
-// Starts an interval that counts down and re-enables the button when done
-function startUnlockCooldown(errEl, unlockBtn) {
+function bfSave(s) {
+  try { localStorage.setItem(BF_STORAGE_KEY, JSON.stringify(s)); } catch (e) {}
+}
+
+function bfReset() {
+  try { localStorage.removeItem(BF_STORAGE_KEY); } catch (e) {}
+}
+
+// Cooldown eksponensial: 0, 0, 10s, 30s, 90s, 3m, 9m, 15m, 15m, 15m, lalu lockout 24 jam
+function getUnlockCooldownMs(attempts) {
+  if (attempts <= 2) return 0;
+  if (attempts >= BF_MAX_ATTEMPTS) return BF_PERM_LOCKOUT_MS;
+  return Math.min(10 * Math.pow(3, attempts - 3), 15 * 60) * 1000;
+}
+
+// Tampilkan countdown dan disable tombol
+function startUnlockCooldown(errEl, unlockBtn, isPermanent) {
   clearInterval(unlockCooldownTimer);
   unlockBtn.disabled = true;
   function tick() {
-    var remaining = Math.ceil((unlockCooldownUntil - Date.now()) / 1000);
+    var s = bfLoad();
+    var until = isPermanent ? s.lockedUntil : s.cooldownUntil;
+    var remaining = Math.ceil((until - Date.now()) / 1000);
     if (remaining <= 0) {
       clearInterval(unlockCooldownTimer);
-      errEl.classList.add('hidden');
-      unlockBtn.disabled = false;
-      unlockBtn.textContent = '🔓 Unlock / Create Wallet';
+      if (!isPermanent) {
+        errEl.classList.add('hidden');
+        unlockBtn.disabled = false;
+        unlockBtn.textContent = '🔓 Unlock / Create Wallet';
+      }
       return;
     }
-    errEl.textContent = '🔒 Too many attempts. Please wait ' + remaining + 's…';
+    var mins = Math.floor(remaining / 60);
+    var secs = remaining % 60;
+    var timeStr = mins > 0 ? mins + 'm ' + secs + 's' : secs + 's';
+    if (isPermanent) {
+      errEl.textContent = '🚫 Terlalu banyak percobaan gagal. Terkunci selama ' + timeStr + '.';
+    } else {
+      errEl.textContent = '🔒 Too many attempts. Please wait ' + timeStr + '…';
+    }
     errEl.classList.remove('hidden');
-    unlockBtn.textContent = '⏳ Wait ' + remaining + 's…';
+    unlockBtn.textContent = '⏳ Wait ' + timeStr + '…';
   }
   tick();
   unlockCooldownTimer = setInterval(tick, 500);
@@ -291,9 +320,17 @@ function setupLogin() {
   });
 
   unlockBtn.addEventListener('click', async function() {
-    // Enforce cooldown between unlock attempts
-    if (Date.now() < unlockCooldownUntil) {
-      startUnlockCooldown(errEl, unlockBtn);
+    var bf = bfLoad();
+
+    // Cek permanent lockout (24 jam)
+    if (bf.lockedUntil && Date.now() < bf.lockedUntil) {
+      startUnlockCooldown(errEl, unlockBtn, true);
+      return;
+    }
+
+    // Cek cooldown biasa
+    if (Date.now() < bf.cooldownUntil) {
+      startUnlockCooldown(errEl, unlockBtn, false);
       return;
     }
 
@@ -319,18 +356,21 @@ function setupLogin() {
     var sp = document.createElement('span');
     sp.className = 'spinner';
     unlockBtn.appendChild(sp);
-    unlockBtn.appendChild(document.createTextNode(' Computing wallet (brute-force protected)…'));
+    unlockBtn.appendChild(document.createTextNode(' Computing wallet…'));
 
-    // Count this attempt and set the next cooldown window.
-    // Note: the counter is intentionally NOT reset on "successful" unlock because
-    // in this app every password produces a valid wallet (there is no wrong password).
-    // Resetting on success would let an attacker bypass the cooldown by simply
-    // cycling through passwords — each one would "succeed" at the UI level.
-    unlockAttemptCount++;
-    var cooldownMs = getUnlockCooldownMs(unlockAttemptCount);
-    if (cooldownMs > 0) {
-      unlockCooldownUntil = Date.now() + cooldownMs;
+    // Hitung attempt dan set cooldown SEBELUM proses — persist ke localStorage
+    // Intentionally tidak di-reset saat berhasil karena setiap password menghasilkan
+    // wallet valid (tidak ada "password salah" di level UI).
+    bf.attempts = (bf.attempts || 0) + 1;
+    var isPermanent = bf.attempts >= BF_MAX_ATTEMPTS;
+    var cooldownMs  = getUnlockCooldownMs(bf.attempts);
+    if (isPermanent) {
+      bf.lockedUntil   = Date.now() + BF_PERM_LOCKOUT_MS;
+      bf.cooldownUntil = 0;
+    } else if (cooldownMs > 0) {
+      bf.cooldownUntil = Date.now() + cooldownMs;
     }
+    bfSave(bf);
 
     var mnemonic = null;
     try {
@@ -363,8 +403,8 @@ function setupLogin() {
       showError(errEl, 'Error generating wallet: ' + (err && err.message ? err.message : 'Please try again.'));
     } finally {
       mnemonic = null;
-      if (cooldownMs > 0) {
-        startUnlockCooldown(errEl, unlockBtn);
+      if (isPermanent || cooldownMs > 0) {
+        startUnlockCooldown(errEl, unlockBtn, isPermanent);
       } else {
         unlockBtn.disabled = false;
         unlockBtn.textContent = '🔓 Unlock / Create Wallet';
