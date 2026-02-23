@@ -574,7 +574,7 @@ html, body {
 }
 .modal-info strong { color: var(--text); }
 
-#send-status {
+#send-status, #send-status-preview {
   font-size: 13px;
   padding: 10px 14px;
   border-radius: 8px;
@@ -582,9 +582,9 @@ html, body {
   align-items: center;
   gap: 8px;
 }
-#send-status.info    { background: rgba(240,185,11,0.1); border: 1px solid rgba(240,185,11,0.3); color: var(--accent); }
-#send-status.success { background: rgba(53,168,83,0.1); border: 1px solid rgba(53,168,83,0.3); color: var(--accent2); }
-#send-status.error   { background: rgba(229,57,53,0.1); border: 1px solid var(--danger); color: var(--danger); }
+#send-status.info, #send-status-preview.info    { background: rgba(240,185,11,0.1); border: 1px solid rgba(240,185,11,0.3); color: var(--accent); }
+#send-status.success, #send-status-preview.success { background: rgba(53,168,83,0.1); border: 1px solid rgba(53,168,83,0.3); color: var(--accent2); }
+#send-status.error, #send-status-preview.error   { background: rgba(229,57,53,0.1); border: 1px solid var(--danger); color: var(--danger); }
 
 /* ===== Sidebar Phrase Button ===== */
 .sidebar-phrase-btn {
@@ -633,6 +633,60 @@ html, body {
   border-radius: 10px;
   padding: 12px 14px;
 }
+
+/* ===== USDT chain dot ===== */
+.chain-dot.usdt { background: #26a17b; }
+
+/* ===== Dry Run Preview ===== */
+.dry-run-box {
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 14px;
+  font-size: 13px;
+}
+
+.dry-run-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.dry-run-table tr { border-bottom: 1px solid var(--border); }
+.dry-run-table tr:last-child { border-bottom: none; }
+
+.dry-run-table th {
+  text-align: left;
+  color: var(--text2);
+  font-weight: 500;
+  padding: 7px 4px;
+  font-size: 12px;
+  width: 45%;
+  vertical-align: top;
+}
+
+.dry-run-table td {
+  text-align: right;
+  color: var(--text);
+  font-weight: 600;
+  padding: 7px 4px;
+  font-size: 12px;
+  word-break: break-all;
+}
+
+.dry-run-note {
+  margin-top: 10px;
+  font-size: 11px;
+  color: var(--accent);
+  line-height: 1.5;
+}
+
+/* ===== Modal Action Row ===== */
+.modal-action-row {
+  display: flex;
+  gap: 10px;
+}
+
+.modal-action-row .btn { flex: 1; }
 
 /* ===== Responsive: Tablet & Desktop ===== */
 @media (min-width: 640px) {

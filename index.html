@@ -101,26 +101,11 @@
       </div>
 
       <!-- Balances -->
-      <div class="balance-grid">
-        <div class="balance-card">
-          <div class="chain-label">
-            <span class="chain-dot bnb"></span> BNB Chain
-          </div>
-          <div class="balance-amount" id="balance-bnb">–</div>
-          <div class="balance-symbol">BNB</div>
-        </div>
-        <div class="balance-card">
-          <div class="chain-label">
-            <span class="chain-dot celo"></span> Celo
-          </div>
-          <div class="balance-amount" id="balance-celo">–</div>
-          <div class="balance-symbol">CELO</div>
-        </div>
-      </div>
+      <div class="balance-grid" id="balance-grid"></div>
 
       <!-- Action bar -->
       <div class="action-bar">
-        <button class="btn btn-primary" id="send-btn">↑ Send BNB</button>
+        <button class="btn btn-primary" id="send-btn">↑ Send USDT</button>
       </div>
 
       <!-- Transactions -->
@@ -141,11 +126,12 @@
 <div id="send-modal-overlay" class="modal-overlay hidden">
   <div class="modal">
     <div class="modal-header">
-      <h3>Send Token</h3>
+      <h3 id="send-modal-title">Send USDT</h3>
       <button class="modal-close" id="send-modal-close">✕</button>
     </div>
 
-    <div class="modal-form">
+    <!-- Step 1: Input -->
+    <div id="send-step-input" class="modal-form">
       <div class="form-field">
         <label for="send-to">Recipient Address</label>
         <input
@@ -159,7 +145,7 @@
       </div>
 
       <div class="form-field">
-        <label for="send-amount">Amount</label>
+        <label for="send-amount">Amount (USDT)</label>
         <div class="amount-input-wrap">
           <input
             class="input"
@@ -169,18 +155,28 @@
             step="any"
             placeholder="0.00"
           />
-          <span class="amount-symbol" id="send-symbol">BNB</span>
+          <span class="amount-symbol">USDT</span>
         </div>
       </div>
 
       <div class="modal-info">
         <strong>From:</strong> <span id="modal-from-addr">–</span><br/>
-        Gas fees will be estimated automatically.
+        Network: <strong id="modal-network-name">–</strong> &nbsp;|&nbsp; USDT will be sent (not native coin).
       </div>
 
       <div id="send-status" class="hidden"></div>
 
-      <button class="btn btn-primary w-full" id="send-confirm-btn">Confirm Send</button>
+      <button class="btn btn-primary w-full" id="dry-run-btn">🔍 Simulate Transfer</button>
+    </div>
+
+    <!-- Step 2: Dry Run Preview -->
+    <div id="send-step-preview" class="modal-form hidden">
+      <div class="dry-run-box" id="dry-run-result"></div>
+      <div id="send-status-preview" class="hidden"></div>
+      <div class="modal-action-row">
+        <button class="btn btn-secondary" id="dry-run-back-btn">← Back</button>
+        <button class="btn btn-primary" id="send-confirm-btn">✓ Confirm Send USDT</button>
+      </div>
     </div>
   </div>
 </div>

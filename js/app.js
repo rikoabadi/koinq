@@ -12,6 +12,7 @@ var state = {
   wallets: [],        // [{address, privateKey}, ...]
   balanceBSC: {},     // {address: '0.0'}
   balanceCELO: {},    // {address: '0.0'}
+  balanceUSDT: {},    // {address_NETWORK: '0.0'}
   transactions: [],
   txLoading: false,
   balLoading: false
@@ -25,7 +26,9 @@ var networks = {
     chainId: 56,
     symbol: 'BNB',
     explorerApi: 'https://api.bscscan.com/api',
-    explorerTx: 'https://bscscan.com/tx/'
+    explorerTx: 'https://bscscan.com/tx/',
+    usdtAddress: '0x55d398326f99059fF775485246999027B3197955',
+    usdtDecimals: 18
   },
   CELO: {
     name: 'Celo',
@@ -33,9 +36,18 @@ var networks = {
     chainId: 42220,
     symbol: 'CELO',
     explorerApi: 'https://api.celoscan.io/api',
-    explorerTx: 'https://celoscan.io/tx/'
+    explorerTx: 'https://celoscan.io/tx/',
+    usdtAddress: '0x617f3112bf5397D0467D315cC709EF968D9ba546',
+    usdtDecimals: 6
   }
 };
+
+/* ===== ERC-20 Minimal ABI ===== */
+var ERC20_ABI = [
+  'function balanceOf(address owner) view returns (uint256)',
+  'function decimals() view returns (uint8)',
+  'function transfer(address to, uint256 amount) returns (bool)'
+];
 
 /* ===== Wallet Core Functions ===== */
 
@@ -77,6 +89,56 @@ async function fetchBalance(address, network) {
   }
 }
 
+// Fetch USDT balance on the given network
+async function fetchUSDTBalance(address, network) {
+  try {
+    var cfg = networks[network];
+    var provider = new ethers.JsonRpcProvider(cfg.rpcUrl);
+    var contract = new ethers.Contract(cfg.usdtAddress, ERC20_ABI, provider);
+    var bal = await contract.balanceOf(address);
+    return ethers.formatUnits(bal, cfg.usdtDecimals);
+  } catch (e) {
+    return '–';
+  }
+}
+
+// Simulate USDT transfer — returns gas estimate details without sending
+async function estimateUSDTTransfer(to, amount, fromAddress, network) {
+  var cfg = networks[network];
+  var provider = new ethers.JsonRpcProvider(cfg.rpcUrl);
+  var contract = new ethers.Contract(cfg.usdtAddress, ERC20_ABI, provider);
+  var amountWei = ethers.parseUnits(amount, cfg.usdtDecimals);
+
+  var [feeData, gasUnits] = await Promise.all([
+    provider.getFeeData(),
+    contract.transfer.estimateGas(to, amountWei, { from: fromAddress })
+  ]);
+
+  var gasPrice = feeData.gasPrice;
+  var gasFeeWei = gasUnits * gasPrice;
+
+  return {
+    to: to,
+    amount: amount,
+    amountWei: amountWei,
+    gasUnits: gasUnits.toString(),
+    gasPriceGwei: ethers.formatUnits(gasPrice, 'gwei'),
+    gasFeeNative: ethers.formatEther(gasFeeWei),
+    gasPrice: gasPrice,
+    network: network
+  };
+}
+
+// Send USDT via ERC-20 transfer
+async function sendUSDT(to, amountWei, privateKey, network, gasPrice) {
+  var cfg = networks[network];
+  var provider = new ethers.JsonRpcProvider(cfg.rpcUrl);
+  var wallet = new ethers.Wallet(privateKey, provider);
+  var contract = new ethers.Contract(cfg.usdtAddress, ERC20_ABI, wallet);
+  var tx = await contract.transfer(to, amountWei, { gasPrice: gasPrice });
+  return tx;
+}
+
 // Fetch last 10 transactions from explorer API
 async function fetchTransactions(address, network) {
   try {
@@ -90,19 +152,6 @@ async function fetchTransactions(address, network) {
   } catch (e) {
     return [];
   }
-}
-
-// Send native token
-async function sendToken(to, amount, privateKey, network) {
-  var provider = new ethers.JsonRpcProvider(networks[network].rpcUrl);
-  var wallet = new ethers.Wallet(privateKey, provider);
-  var feeData = await provider.getFeeData();
-  var tx = await wallet.sendTransaction({
-    to: to,
-    value: ethers.parseEther(amount),
-    gasPrice: feeData.gasPrice
-  });
-  return tx;
 }
 
 /* ===== DOM Helpers ===== */
@@ -227,8 +276,6 @@ function renderSidebar() {
     item.dataset.index = i;
 
     var avatarClass = (i % 2 === 0) ? 'wallet-avatar' : 'wallet-avatar alt';
-    var bnbBal  = state.balanceBSC[w.address]  ? formatAmount(state.balanceBSC[w.address])  : '…';
-    var celoBal = state.balanceCELO[w.address] ? formatAmount(state.balanceCELO[w.address]) : '…';
 
     item.innerHTML =
       '<div class="' + avatarClass + '">' + (i + 1) + '</div>' +
@@ -268,22 +315,79 @@ function showMainPanel(show) {
   }
 }
 
+function renderBalanceGrid(addr) {
+  var net = state.network;
+  var cfg = networks[net];
+  var grid = $('balance-grid');
+
+  var nativeBal;
+  if (net === 'BSC') {
+    nativeBal = state.balanceBSC[addr] !== undefined
+      ? formatAmount(state.balanceBSC[addr]) : (state.balLoading ? '…' : '–');
+  } else {
+    nativeBal = state.balanceCELO[addr] !== undefined
+      ? formatAmount(state.balanceCELO[addr]) : (state.balLoading ? '…' : '–');
+  }
+
+  var usdtKey = addr + '_' + net;
+  var usdtBal = state.balanceUSDT[usdtKey] !== undefined
+    ? formatAmount(state.balanceUSDT[usdtKey]) : (state.balLoading ? '…' : '–');
+
+  var dotClass = net === 'BSC' ? 'bnb' : 'celo';
+
+  // Build cards safely
+  grid.innerHTML = '';
+
+  var card1 = document.createElement('div');
+  card1.className = 'balance-card';
+  var label1 = document.createElement('div');
+  label1.className = 'chain-label';
+  var dot1 = document.createElement('span');
+  dot1.className = 'chain-dot ' + dotClass;
+  label1.appendChild(dot1);
+  label1.appendChild(document.createTextNode(' ' + cfg.name));
+  var amt1 = document.createElement('div');
+  amt1.className = 'balance-amount';
+  amt1.id = 'balance-native';
+  amt1.textContent = nativeBal;
+  var sym1 = document.createElement('div');
+  sym1.className = 'balance-symbol';
+  sym1.textContent = cfg.symbol;
+  card1.appendChild(label1);
+  card1.appendChild(amt1);
+  card1.appendChild(sym1);
+
+  var card2 = document.createElement('div');
+  card2.className = 'balance-card';
+  var label2 = document.createElement('div');
+  label2.className = 'chain-label';
+  var dot2 = document.createElement('span');
+  dot2.className = 'chain-dot usdt';
+  label2.appendChild(dot2);
+  label2.appendChild(document.createTextNode(' Tether USD'));
+  var amt2 = document.createElement('div');
+  amt2.className = 'balance-amount';
+  amt2.id = 'balance-usdt';
+  amt2.textContent = usdtBal;
+  var sym2 = document.createElement('div');
+  sym2.className = 'balance-symbol';
+  sym2.textContent = 'USDT';
+  card2.appendChild(label2);
+  card2.appendChild(amt2);
+  card2.appendChild(sym2);
+
+  grid.appendChild(card1);
+  grid.appendChild(card2);
+}
+
 function renderMainPanel() {
   var addr = state.currentAddress;
-  var idx  = state.currentIndex;
-  var net  = state.network;
 
   // Address
   $('main-address-full').textContent = addr;
 
-  // Balances
-  var bnbEl  = $('balance-bnb');
-  var celoEl = $('balance-celo');
-  bnbEl.textContent  = state.balanceBSC[addr]  ? formatAmount(state.balanceBSC[addr])  : (state.balLoading ? '…' : '–');
-  celoEl.textContent = state.balanceCELO[addr] ? formatAmount(state.balanceCELO[addr]) : (state.balLoading ? '…' : '–');
-
-  // Network badge on send btn
-  $('send-btn').textContent = '↑ Send ' + networks[net].symbol;
+  // Dynamic balance grid for active network
+  renderBalanceGrid(addr);
 
   renderTransactions();
 }
@@ -320,7 +424,7 @@ function renderTransactions() {
       '<div class="tx-icon ' + direction + '">' + dirIcon + '</div>' +
       '<div class="tx-info">' +
         '<div class="tx-type">' + dirLabel + '</div>' +
-        '<a class="tx-hash" href="' + explorerUrl + '" target="_blank" rel="noopener">' + tx.hash.slice(0, 20) + '…</a>' +
+        '<a class="tx-hash" href="' + explorerUrl + '" target="_blank" rel="noopener noreferrer">' + tx.hash.slice(0, 20) + '…</a>' +
       '</div>' +
       '<div class="tx-right">' +
         '<div class="tx-amount ' + (isIn ? 'text-green' : 'text-danger') + '">' +
@@ -341,20 +445,24 @@ async function loadAddressData(address) {
 
 async function loadBalances(address) {
   state.balLoading = true;
-  renderMainPanel();
+  if (state.currentAddress === address) renderMainPanel();
 
-  var [bnb, celo] = await Promise.all([
+  var net = state.network;
+  var usdtKey = address + '_' + net;
+
+  var results = await Promise.all([
     fetchBalance(address, 'BSC'),
-    fetchBalance(address, 'CELO')
+    fetchBalance(address, 'CELO'),
+    fetchUSDTBalance(address, net)
   ]);
 
-  state.balanceBSC[address]  = bnb;
-  state.balanceCELO[address] = celo;
+  state.balanceBSC[address]   = results[0];
+  state.balanceCELO[address]  = results[1];
+  state.balanceUSDT[usdtKey]  = results[2];
   state.balLoading = false;
 
   if (state.currentAddress === address) {
-    $('balance-bnb').textContent  = formatAmount(bnb);
-    $('balance-celo').textContent = formatAmount(celo);
+    renderBalanceGrid(address);
     renderSidebar();
   }
 }
@@ -381,12 +489,26 @@ function updateNetworkUI() {
 function setupNetworkSwitcher() {
   document.querySelectorAll('.net-btn').forEach(function(btn) {
     btn.addEventListener('click', function() {
+      if (state.network === this.dataset.net) return;
       state.network = this.dataset.net;
       updateNetworkUI();
       state.transactions = [];
       if (state.currentAddress) {
         renderMainPanel();
-        loadTransactions(state.currentAddress);
+        // Reload USDT balance for new network and transactions
+        var addr = state.currentAddress;
+        var net = state.network;
+        var usdtKey = addr + '_' + net;
+        if (state.balanceUSDT[usdtKey] === undefined) {
+          state.balLoading = true;
+          renderBalanceGrid(addr);
+          fetchUSDTBalance(addr, net).then(function(bal) {
+            state.balanceUSDT[usdtKey] = bal;
+            state.balLoading = false;
+            if (state.currentAddress === addr) renderBalanceGrid(addr);
+          });
+        }
+        loadTransactions(addr);
       }
     });
   });
@@ -394,22 +516,36 @@ function setupNetworkSwitcher() {
 
 /* ===== Send Modal ===== */
 function setupSendModal() {
-  var sendBtn    = $('send-btn');
-  var overlay    = $('send-modal-overlay');
-  var closeBtn   = $('send-modal-close');
-  var confirmBtn = $('send-confirm-btn');
-  var toInput    = $('send-to');
-  var amtInput   = $('send-amount');
-  var statusEl   = $('send-status');
-  var symEl      = $('send-symbol');
+  var sendBtn       = $('send-btn');
+  var overlay       = $('send-modal-overlay');
+  var closeBtn      = $('send-modal-close');
+  var dryRunBtn     = $('dry-run-btn');
+  var backBtn       = $('dry-run-back-btn');
+  var confirmBtn    = $('send-confirm-btn');
+  var toInput       = $('send-to');
+  var amtInput      = $('send-amount');
+  var statusEl      = $('send-status');
+  var statusPreview = $('send-status-preview');
+  var stepInput     = $('send-step-input');
+  var stepPreview   = $('send-step-preview');
+  var titleEl       = $('send-modal-title');
+  var netNameEl     = $('modal-network-name');
+
+  // Cached dry-run data used when confirming
+  var pendingTx = null;
 
   function openModal() {
     toInput.value  = '';
     amtInput.value = '';
     statusEl.classList.add('hidden');
     statusEl.textContent = '';
-    symEl.textContent = networks[state.network].symbol;
-    var fromEl = document.getElementById('modal-from-addr');
+    pendingTx = null;
+    stepInput.classList.remove('hidden');
+    stepPreview.classList.add('hidden');
+    var net = state.network;
+    titleEl.textContent = 'Send USDT (' + networks[net].symbol + ' network)';
+    netNameEl.textContent = networks[net].name;
+    var fromEl = $('modal-from-addr');
     if (fromEl) fromEl.textContent = state.currentAddress || '–';
     overlay.classList.remove('hidden');
     toInput.focus();
@@ -417,6 +553,17 @@ function setupSendModal() {
 
   function closeModal() {
     overlay.classList.add('hidden');
+    pendingTx = null;
+  }
+
+  function showStep(step) {
+    if (step === 'input') {
+      stepInput.classList.remove('hidden');
+      stepPreview.classList.add('hidden');
+    } else {
+      stepInput.classList.add('hidden');
+      stepPreview.classList.remove('hidden');
+    }
   }
 
   sendBtn.addEventListener('click', openModal);
@@ -425,13 +572,19 @@ function setupSendModal() {
     if (e.target === overlay) closeModal();
   });
 
-  confirmBtn.addEventListener('click', async function() {
+  backBtn.addEventListener('click', function() {
+    pendingTx = null;
+    statusPreview.classList.add('hidden');
+    showStep('input');
+  });
+
+  // --- Dry Run ---
+  dryRunBtn.addEventListener('click', async function() {
     var to     = toInput.value.trim();
     var amount = amtInput.value.trim();
     var net    = state.network;
     var wallet = state.wallets[state.currentIndex];
 
-    // Validate
     if (!ethers.isAddress(to)) {
       setStatus(statusEl, 'error', '✗ Invalid recipient address.');
       return;
@@ -441,20 +594,83 @@ function setupSendModal() {
       return;
     }
 
-    confirmBtn.disabled = true;
-    setStatus(statusEl, 'info', '<span class="spinner"></span> Sending transaction…');
+    // Check recipient is not the same as sender
+    if (to.toLowerCase() === state.currentAddress.toLowerCase()) {
+      setStatus(statusEl, 'error', '✗ Cannot send to your own address.');
+      return;
+    }
+
+    dryRunBtn.disabled = true;
+    setStatus(statusEl, 'info', '<span class="spinner"></span> Simulating transfer…');
 
     try {
-      var tx = await sendToken(to, amount, wallet.privateKey, net);
-      setStatus(statusEl, 'success', '✓ Sent! TX: ' + tx.hash.slice(0, 16) + '…');
-      showToast('Transaction sent successfully!', 'success');
+      var est = await estimateUSDTTransfer(to, amount, wallet.address, net);
+      pendingTx = est;
+
+      // Build dry run preview
+      var box = $('dry-run-result');
+      box.innerHTML = '';
+
+      var rows = [
+        ['Token',          'USDT'],
+        ['Network',        networks[net].name],
+        ['From',           shortenAddress(wallet.address)],
+        ['To',             shortenAddress(to)],
+        ['Amount',         amount + ' USDT'],
+        ['Gas Units',      parseInt(est.gasUnits, 10).toLocaleString()],
+        ['Gas Price',      (+est.gasPriceGwei).toFixed(4) + ' Gwei'],
+        ['Est. Network Fee', (+est.gasFeeNative).toFixed(8) + ' ' + networks[net].symbol]
+      ];
+
+      var table = document.createElement('table');
+      table.className = 'dry-run-table';
+      rows.forEach(function(row) {
+        var tr = document.createElement('tr');
+        var th = document.createElement('th');
+        th.textContent = row[0];
+        var td = document.createElement('td');
+        td.textContent = row[1];
+        tr.appendChild(th);
+        tr.appendChild(td);
+        table.appendChild(tr);
+      });
+
+      var note = document.createElement('p');
+      note.className = 'dry-run-note';
+      note.textContent = '⚠ Network fees are paid in ' + networks[net].symbol + '. Make sure your wallet has enough ' + networks[net].symbol + ' for gas.';
+      box.appendChild(table);
+      box.appendChild(note);
+
+      statusPreview.classList.add('hidden');
+      showStep('preview');
+      statusEl.classList.add('hidden');
+    } catch (err) {
+      var msg = err.reason || err.message || 'Simulation failed. Check balance or address.';
+      setStatus(statusEl, 'error', '✗ ' + msg.slice(0, 120));
+    }
+
+    dryRunBtn.disabled = false;
+  });
+
+  // --- Confirm Send ---
+  confirmBtn.addEventListener('click', async function() {
+    if (!pendingTx) return;
+
+    var wallet = state.wallets[state.currentIndex];
+    confirmBtn.disabled = true;
+    setStatus(statusPreview, 'info', '<span class="spinner"></span> Sending USDT…');
+
+    try {
+      var tx = await sendUSDT(pendingTx.to, pendingTx.amountWei, wallet.privateKey, pendingTx.network, pendingTx.gasPrice);
+      setStatus(statusPreview, 'success', '✓ Sent! TX: ' + tx.hash.slice(0, 18) + '…');
+      showToast('USDT sent successfully!', 'success');
       setTimeout(function() {
         closeModal();
         loadAddressData(state.currentAddress);
       }, 2500);
     } catch (err) {
-      var msg = err.reason || err.message || 'Transaction failed. Please check your balance and try again.';
-      setStatus(statusEl, 'error', '✗ ' + msg.slice(0, 80));
+      var msg = err.reason || err.message || 'Transaction failed. Check your USDT and gas balance.';
+      setStatus(statusPreview, 'error', '✗ ' + msg.slice(0, 120));
     }
 
     confirmBtn.disabled = false;
@@ -486,6 +702,7 @@ function setupLogout() {
     state.transactions = [];
     state.balanceBSC  = {};
     state.balanceCELO = {};
+    state.balanceUSDT = {};
     $('password-input').value = '';
     $('login-error').classList.add('hidden');
     showScreen('login-screen');
@@ -617,3 +834,4 @@ function init() {
 }
 
 document.addEventListener('DOMContentLoaded', init);
+
