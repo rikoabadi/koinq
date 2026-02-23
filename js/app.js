@@ -4,7 +4,7 @@
    =================================================== */
 
 /* ===== HTTPS Enforcement ===== */
-if (location.protocol !== 'https:' &&
+if (location.protocol === 'http:' &&
     location.hostname !== 'localhost' &&
     location.hostname !== '127.0.0.1') {
   location.replace('https:' + location.href.substring(location.protocol.length));
@@ -262,6 +262,18 @@ function setupLogin() {
     if (!pwd) { showError(errEl, 'Please enter a password.'); return; }
     if (pwd.length < 6) { showError(errEl, 'Password must be at least 6 characters.'); return; }
 
+    // Check for secure context (crypto.subtle requires HTTPS or localhost)
+    if (!crypto.subtle) {
+      showError(errEl, 'Secure context required. Please open this app over HTTPS or localhost.');
+      return;
+    }
+
+    // Check that the ethers library loaded correctly
+    if (typeof ethers === 'undefined') {
+      showError(errEl, 'Required library failed to load. Please refresh the page.');
+      return;
+    }
+
     errEl.classList.add('hidden');
     unlockBtn.disabled = true;
     unlockBtn.textContent = '';
@@ -270,9 +282,10 @@ function setupLogin() {
     unlockBtn.appendChild(sp);
     unlockBtn.appendChild(document.createTextNode(' Generating wallet…'));
 
+    var mnemonic = null;
     try {
       await initSessionKey(pwd);
-      var mnemonic = await generateMnemonicFromPassword(pwd);
+      mnemonic = await generateMnemonicFromPassword(pwd);
       state.encryptedMnemonic = await encryptStr(mnemonic);
 
       // Derive wallets 0–5
@@ -284,7 +297,6 @@ function setupLogin() {
           encryptedPrivateKey: await encryptStr(w.privateKey)
         });
       }
-      mnemonic = null;
 
       state.currentIndex = 0;
       state.currentAddress = state.wallets[0].address;
@@ -298,11 +310,12 @@ function setupLogin() {
       }
       loadAddressData(state.currentAddress);
     } catch (err) {
-      showError(errEl, 'Error generating wallet. Please try again.');
+      showError(errEl, 'Error generating wallet: ' + (err && err.message ? err.message : 'Please try again.'));
+    } finally {
+      mnemonic = null;
+      unlockBtn.disabled = false;
+      unlockBtn.textContent = '🔓 Unlock / Create Wallet';
     }
-
-    unlockBtn.disabled = false;
-    unlockBtn.textContent = '🔓 Unlock / Create Wallet';
   });
 }
 
@@ -927,10 +940,9 @@ function setupPhraseModal() {
     } finally {
       storedMnemonic = null;
       derivedMnemonic = null;
+      confirmBtn.disabled = false;
+      confirmBtn.textContent = '📋 Copy Phrase to Clipboard';
     }
-
-    confirmBtn.disabled = false;
-    confirmBtn.textContent = '📋 Copy Phrase to Clipboard';
   });
 }
 
