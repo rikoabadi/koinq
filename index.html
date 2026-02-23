@@ -76,8 +76,13 @@
     <aside class="dsh-sidebar" id="dsh-sidebar">
       <div class="sidebar-header">
         <h3>My Wallets</h3>
+        <button class="btn btn-ghost sidebar-phrase-btn" id="copy-phrase-btn" title="Copy recovery phrase">🔑 Phrase</button>
       </div>
       <div class="wallet-list" id="wallet-list"></div>
+      <!-- Floating Add Wallet button (inside sidebar on mobile) -->
+      <div class="fab-wrap">
+        <button class="fab" id="add-wallet-fab" title="Add wallet">＋ Add Wallet</button>
+      </div>
     </aside>
 
     <!-- Main panel -->
@@ -176,6 +181,34 @@
       <div id="send-status" class="hidden"></div>
 
       <button class="btn btn-primary w-full" id="send-confirm-btn">Confirm Send</button>
+    </div>
+  </div>
+</div>
+
+<!-- ===================== PHRASE MODAL ===================== -->
+<div id="phrase-modal-overlay" class="modal-overlay hidden">
+  <div class="modal">
+    <div class="modal-header">
+      <h3>🔑 Copy Recovery Phrase</h3>
+      <button class="modal-close" id="phrase-modal-close">✕</button>
+    </div>
+    <div class="modal-form">
+      <p class="phrase-modal-desc">Enter your master password to confirm, then your 24-word recovery phrase will be copied to clipboard.</p>
+      <div class="form-field">
+        <label for="phrase-pwd-input">Master Password</label>
+        <div class="input-group">
+          <input
+            class="input"
+            id="phrase-pwd-input"
+            type="password"
+            placeholder="Enter your password"
+            autocomplete="current-password"
+          />
+          <button class="input-icon" id="phrase-toggle-pwd" type="button" title="Show/hide password">👁</button>
+        </div>
+      </div>
+      <div id="phrase-status" class="hidden"></div>
+      <button class="btn btn-primary w-full" id="phrase-confirm-btn">📋 Copy Phrase to Clipboard</button>
     </div>
   </div>
 </div>
