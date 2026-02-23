@@ -136,6 +136,7 @@ async function sendToken(to, amount, encryptedPrivateKey, network) {
   var privateKey = await decryptStr(encryptedPrivateKey);
   var provider = new ethers.JsonRpcProvider(networks[network].rpcUrl);
   var wallet = new ethers.Wallet(privateKey, provider);
+  privateKey = null; // Clear local reference once Wallet object is created
   var feeData = await provider.getFeeData();
   var tx = await wallet.sendTransaction({
     to: to,
@@ -686,23 +687,22 @@ function setupPhraseModal() {
       var storedMnemonic = await decryptStr(state.encryptedMnemonic);
       if (derivedMnemonic === storedMnemonic) {
         navigator.clipboard.writeText(storedMnemonic).then(function() {
-          storedMnemonic = null;
           setStatus(statusEl, 'success', '✓ Recovery phrase copied to clipboard!');
           showToast('Recovery phrase copied to clipboard', 'success');
           setTimeout(closeModal, 2000);
         }).catch(function() {
-          storedMnemonic = null;
           setStatus(statusEl, 'error', '✗ Clipboard access denied. Please allow clipboard permissions.');
         });
       } else {
-        storedMnemonic = null;
-        derivedMnemonic = null;
         setStatus(statusEl, 'error', '✗ Incorrect password. Please try again.');
         pwdInput.value = '';
         pwdInput.focus();
       }
     } catch (err) {
       setStatus(statusEl, 'error', '✗ Error verifying password.');
+    } finally {
+      storedMnemonic = null;
+      derivedMnemonic = null;
     }
 
     confirmBtn.disabled = false;
