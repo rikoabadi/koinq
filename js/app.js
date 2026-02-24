@@ -124,20 +124,30 @@ var networks = {
   BSC: {
     name: 'BNB Smart Chain',
     rpcUrl: 'https://bsc-dataseed.binance.org/',
+    rpcFallbacks: [
+      'https://bsc-dataseed1.binance.org/',
+      'https://bsc-dataseed2.binance.org/',
+      'https://bsc-dataseed3.binance.org/'
+    ],
     chainId: 56,
     symbol: 'BNB',
     explorerApi: 'https://api.bscscan.com/api',
     explorerTx: 'https://bscscan.com/tx/',
+    explorerAddr: 'https://bscscan.com/address/',
     usdtAddress: '0x55d398326f99059fF775485246999027B3197955',
     usdtDecimals: 18
   },
   CELO: {
     name: 'Celo',
     rpcUrl: 'https://forno.celo.org',
+    rpcFallbacks: [
+      'https://rpc.ankr.com/celo'
+    ],
     chainId: 42220,
     symbol: 'CELO',
     explorerApi: 'https://api.celoscan.io/api',
     explorerTx: 'https://celoscan.io/tx/',
+    explorerAddr: 'https://celoscan.io/address/',
     usdtAddress: '0x617f3112bf5397D0467D315cC709EF968D9ba546',
     usdtDecimals: 6
   }
@@ -191,28 +201,33 @@ function getHDWallet(mnemonic, index) {
   return { address: wallet.address, privateKey: wallet.privateKey };
 }
 
-// Fetch native balance for a single network
+// Fetch native balance — tries primary RPC then fallbacks
 async function fetchBalance(address, network) {
-  try {
-    var provider = new ethers.JsonRpcProvider(networks[network].rpcUrl);
-    var bal = await provider.getBalance(address);
-    return ethers.formatEther(bal);
-  } catch (e) {
-    return '–';
+  var cfg = networks[network];
+  var rpcs = [cfg.rpcUrl].concat(cfg.rpcFallbacks || []);
+  for (var i = 0; i < rpcs.length; i++) {
+    try {
+      var provider = new ethers.JsonRpcProvider(rpcs[i]);
+      var bal = await provider.getBalance(address);
+      return ethers.formatEther(bal);
+    } catch (e) { /* try next */ }
   }
+  return '–';
 }
 
-// Fetch USDT balance on the given network
+// Fetch USDT balance — tries primary RPC then fallbacks
 async function fetchUSDTBalance(address, network) {
-  try {
-    var cfg = networks[network];
-    var provider = new ethers.JsonRpcProvider(cfg.rpcUrl);
-    var contract = new ethers.Contract(cfg.usdtAddress, ERC20_ABI, provider);
-    var bal = await contract.balanceOf(address);
-    return ethers.formatUnits(bal, cfg.usdtDecimals);
-  } catch (e) {
-    return '–';
+  var cfg = networks[network];
+  var rpcs = [cfg.rpcUrl].concat(cfg.rpcFallbacks || []);
+  for (var i = 0; i < rpcs.length; i++) {
+    try {
+      var provider = new ethers.JsonRpcProvider(rpcs[i]);
+      var contract = new ethers.Contract(cfg.usdtAddress, ERC20_ABI, provider);
+      var bal = await contract.balanceOf(address);
+      return ethers.formatUnits(bal, cfg.usdtDecimals);
+    } catch (e) { /* try next */ }
   }
+  return '–';
 }
 
 // Simulate USDT transfer — returns gas estimate details without sending
@@ -254,18 +269,39 @@ async function sendUSDT(to, amountWei, encryptedPrivateKey, network, gasPrice) {
   return tx;
 }
 
-// Fetch last 10 transactions from explorer API
+// Normalise a tx object so both BSCScan and CeloScan formats work
+function normaliseTx(tx) {
+  return {
+    hash:      tx.hash || tx.transactionHash || '',
+    from:      tx.from || '',
+    to:        tx.to   || tx.contractAddress || '',
+    value:     tx.value || '0',
+    timeStamp: tx.timeStamp || tx.timestamp || '0',
+    isError:   tx.isError || '0'
+  };
+}
+
+// Fetch last 20 transactions from explorer API
 async function fetchTransactions(address, network) {
+  var cfg = networks[network];
+  var api = cfg.explorerApi;
+  var url = api + '?module=account&action=txlist&address=' + encodeURIComponent(address) +
+            '&startblock=0&endblock=99999999&page=1&offset=20&sort=desc';
   try {
-    var api = networks[network].explorerApi;
-    var url = api + '?module=account&action=txlist&address=' + encodeURIComponent(address) +
-              '&startblock=0&endblock=99999999&page=1&offset=10&sort=desc';
     var res = await fetch(url, { mode: 'cors', credentials: 'omit' });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
     var data = await res.json();
-    if (data.status === '1' && Array.isArray(data.result)) return data.result;
-    return [];
+    if (data.status === '1' && Array.isArray(data.result) && data.result.length > 0) {
+      return data.result.map(normaliseTx);
+    }
+    // status '0' with message NOTOK means no tx, not an error
+    if (data.message === 'No transactions found') return [];
+    throw new Error(data.message || 'empty');
   } catch (e) {
-    return [];
+    // Fallback: read last 20 blocks of tx via RPC eth_getTransactionCount
+    // (block explorer CORS failed — return empty with note)
+    console.warn('Explorer API failed for ' + network + ':', e.message);
+    return null; // null = API failed (distinguished from empty [])
   }
 }
 
@@ -727,79 +763,119 @@ function renderTransactions() {
   var net  = state.network;
 
   if (state.txLoading) {
-    list.textContent = '';
+    list.innerHTML = '';
     var loadingDiv = document.createElement('div');
     loadingDiv.className = 'tx-loading';
     var spinnerEl = document.createElement('span');
     spinnerEl.className = 'spinner';
     loadingDiv.appendChild(spinnerEl);
+    loadingDiv.appendChild(document.createTextNode(' Loading transactions…'));
     list.appendChild(loadingDiv);
     return;
   }
 
+  if (state.transactions === null) {
+    list.innerHTML = '';
+    var errDiv = document.createElement('div');
+    errDiv.className = 'tx-empty';
+    errDiv.innerHTML = '⚠️ Explorer API unavailable.<br/><small>Check your connection or try again later.</small>';
+    list.appendChild(errDiv);
+    return;
+  }
+
   if (!state.transactions || state.transactions.length === 0) {
-    list.textContent = '';
+    list.innerHTML = '';
     var emptyDiv = document.createElement('div');
     emptyDiv.className = 'tx-empty';
-    emptyDiv.textContent = 'No transactions found';
+    emptyDiv.textContent = 'No transactions found for this address.';
     list.appendChild(emptyDiv);
     return;
   }
 
-  list.textContent = '';
+  list.innerHTML = '';
+
+  // Table header
+  var header = document.createElement('div');
+  header.className = 'tx-table-header';
+  header.innerHTML =
+    '<span>Tx Hash</span>' +
+    '<span>From</span>' +
+    '<span>To</span>' +
+    '<span>Age</span>' +
+    '<span>Amount</span>' +
+    '<span>Detail</span>';
+  list.appendChild(header);
+
   state.transactions.forEach(function(tx) {
     var isIn = tx.to && tx.to.toLowerCase() === addr.toLowerCase();
-    var direction = isIn ? 'in' : 'out';
-    var dirIcon   = isIn ? '↓' : '↑';
-    var dirLabel  = isIn ? 'Received' : 'Sent';
     var amountEth = ethers.formatEther(tx.value || '0');
     var amountFmt = formatAmount(amountEth);
     var sym       = networks[net].symbol;
-    var explorerUrl = networks[net].explorerTx + encodeURIComponent(tx.hash);
+    var explorerUrl = networks[net].explorerTx + tx.hash;
 
-    var item = document.createElement('div');
-    item.className = 'tx-item';
+    var row = document.createElement('div');
+    row.className = 'tx-row' + (tx.isError === '1' ? ' tx-error' : '');
 
-    var iconEl = document.createElement('div');
-    iconEl.className = 'tx-icon ' + direction;
-    iconEl.textContent = dirIcon;
+    // Tx Hash
+    var cellHash = document.createElement('div');
+    cellHash.className = 'tx-cell tx-cell-hash';
+    var hashLink = document.createElement('a');
+    hashLink.href = explorerUrl;
+    hashLink.target = '_blank';
+    hashLink.rel = 'noopener noreferrer';
+    hashLink.className = 'tx-hash-link';
+    hashLink.textContent = tx.hash.slice(0, 8) + '…' + tx.hash.slice(-6);
+    hashLink.title = tx.hash;
+    cellHash.appendChild(hashLink);
 
-    var infoEl = document.createElement('div');
-    infoEl.className = 'tx-info';
+    // From
+    var cellFrom = document.createElement('div');
+    cellFrom.className = 'tx-cell tx-cell-addr';
+    var fromEl = document.createElement('span');
+    fromEl.className = isIn ? 'tx-addr-ext' : 'tx-addr-self';
+    fromEl.textContent = shortenAddress(tx.from || '0x???');
+    fromEl.title = tx.from;
+    cellFrom.appendChild(fromEl);
 
-    var typeEl = document.createElement('div');
-    typeEl.className = 'tx-type';
-    typeEl.textContent = dirLabel;
+    // To
+    var cellTo = document.createElement('div');
+    cellTo.className = 'tx-cell tx-cell-addr';
+    var toEl = document.createElement('span');
+    toEl.className = isIn ? 'tx-addr-self' : 'tx-addr-ext';
+    toEl.textContent = shortenAddress(tx.to || '0x???');
+    toEl.title = tx.to;
+    cellTo.appendChild(toEl);
 
-    var hashEl = document.createElement('a');
-    hashEl.className = 'tx-hash';
-    hashEl.href = explorerUrl;
-    hashEl.target = '_blank';
-    hashEl.rel = 'noopener noreferrer';
-    hashEl.textContent = tx.hash.slice(0, 20) + '…';
+    // Age
+    var cellAge = document.createElement('div');
+    cellAge.className = 'tx-cell tx-cell-age';
+    cellAge.textContent = timeAgo(tx.timeStamp);
 
-    infoEl.appendChild(typeEl);
-    infoEl.appendChild(hashEl);
+    // Amount
+    var cellAmt = document.createElement('div');
+    cellAmt.className = 'tx-cell tx-cell-amount ' + (isIn ? 'text-green' : 'text-danger');
+    cellAmt.textContent = (isIn ? '+' : '-') + amountFmt + ' ' + sym;
+    if (tx.isError === '1') { cellAmt.textContent = 'Failed'; cellAmt.className = 'tx-cell tx-cell-amount tx-failed'; }
 
-    var rightEl = document.createElement('div');
-    rightEl.className = 'tx-right';
+    // Detail link
+    var cellDetail = document.createElement('div');
+    cellDetail.className = 'tx-cell tx-cell-detail';
+    var detailLink = document.createElement('a');
+    detailLink.href = explorerUrl;
+    detailLink.target = '_blank';
+    detailLink.rel = 'noopener noreferrer';
+    detailLink.className = 'tx-detail-btn';
+    detailLink.textContent = '🔗';
+    detailLink.title = 'View on explorer';
+    cellDetail.appendChild(detailLink);
 
-    var amountEl = document.createElement('div');
-    amountEl.className = 'tx-amount ' + (isIn ? 'text-green' : 'text-danger');
-    amountEl.textContent = (isIn ? '+' : '-') + amountFmt + ' ' + sym;
-
-    var timeEl = document.createElement('div');
-    timeEl.className = 'tx-time';
-    timeEl.textContent = timeAgo(tx.timeStamp);
-
-    rightEl.appendChild(amountEl);
-    rightEl.appendChild(timeEl);
-
-    item.appendChild(iconEl);
-    item.appendChild(infoEl);
-    item.appendChild(rightEl);
-
-    list.appendChild(item);
+    row.appendChild(cellHash);
+    row.appendChild(cellFrom);
+    row.appendChild(cellTo);
+    row.appendChild(cellAge);
+    row.appendChild(cellAmt);
+    row.appendChild(cellDetail);
+    list.appendChild(row);
   });
 }
 
@@ -839,6 +915,7 @@ async function loadTransactions(address) {
   renderTransactions();
 
   var txs = await fetchTransactions(address, state.network);
+  // null = API error, [] = no txs found, array = results
   state.transactions = txs;
   state.txLoading = false;
 
