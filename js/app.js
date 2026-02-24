@@ -1070,13 +1070,14 @@ function setupLogin() {
     bfSave(bf);
 
     var mnemonic = null;
+    var combinedSecret = null; // deklarasi di luar try agar bisa di-null di finally
     try {
       // Combined secret: "koinq:v2:" + masterPassword + ":" + SHA-256 hex of key file
       // Attacker needs BOTH the password AND the exact file to reproduce the mnemonic.
-      var combinedSecret = 'koinq:v2:' + pwd + ':' + finalHash;
+      combinedSecret = 'koinq:v2:' + pwd + ':' + finalHash;
       await initSessionKey(combinedSecret);
       mnemonic = await generateMnemonicFromPassword(combinedSecret);
-      combinedSecret = null; // clear reference immediately
+      combinedSecret = null; // clear reference immediately after use
       state.encryptedMnemonic = await encryptStr(mnemonic);
 
       // Derive wallets 0–5
@@ -1103,6 +1104,7 @@ function setupLogin() {
     } catch (err) {
       showError(errEl, 'Error generating wallet: ' + (err && err.message ? err.message : 'Please try again.'));
     } finally {
+      combinedSecret = null; // garantinya ter-null meski initSessionKey/generateMnemonic throws
       mnemonic = null;
       if (isPermanent || cooldownMs > 0) {
         startUnlockCooldown(errEl, unlockBtn, isPermanent);
@@ -1391,16 +1393,27 @@ async function loadAddressData(address) {
 // Fetch native + USDT balance untuk network aktif saja (efisien, tidak fetch semua network)
 async function loadBalances(address) {
   state.balLoading = true;
-  if (state.currentAddress === address) renderMainPanel();
+  // Hanya update balance grid — jangan renderMainPanel() karena itu juga trigger renderTransactions()
+  if (state.currentAddress === address) renderBalanceGrid(address);
 
   var net = state.network;
   var usdtKey = address + '_' + net;
 
   // Fetch native balance network aktif + USDT network aktif secara paralel
-  var results = await Promise.all([
-    fetchBalance(address, net),
-    fetchUSDTBalance(address, net)
-  ]);
+  var results;
+  try {
+    results = await Promise.all([
+      fetchBalance(address, net),
+      fetchUSDTBalance(address, net)
+    ]);
+  } catch (e) {
+    // Unexpected rejection (kedua fetchBalance/fetchUSDTBalance seharusnya sudah handle error internal)
+    // Tetap reset balLoading agar spinner tidak stuck
+    console.warn('[KoinQ] loadBalances unexpected error:', e && e.message);
+    state.balLoading = false;
+    if (state.currentAddress === address) renderBalanceGrid(address);
+    return;
+  }
 
   // Guard: jika user sudah ganti wallet selama fetch, buang hasil stale
   if (address !== state.currentAddress || net !== state.network) {
@@ -1473,29 +1486,44 @@ function setupNetworkSwitcher() {
       var net  = state.network;
       var usdtKey = addr + '_' + net;
 
-      // Fetch USDT jika belum ada untuk network ini
-      if (state.balanceUSDT[usdtKey] === undefined) {
+      // Fetch USDT + native jika belum ada untuk network ini
+      // Gunakan counter (bukan boolean) agar balLoading tidak false sebelum kedua fetch selesai
+      var needUsdt   = (state.balanceUSDT[usdtKey] === undefined);
+      var nativeCache = net === 'BSC' ? state.balanceBSC[addr] : state.balanceCELO[addr];
+      var needNative = (nativeCache === undefined || isNaN(parseFloat(nativeCache)));
+      var pending = (needUsdt ? 1 : 0) + (needNative ? 1 : 0);
+
+      function onNetFetchDone() {
+        pending--;
+        if (pending <= 0) {
+          state.balLoading = false;
+        }
+        if (state.currentAddress === addr && state.network === net) renderBalanceGrid(addr);
+      }
+
+      if (pending > 0) {
         state.balLoading = true;
         renderBalanceGrid(addr);
+      }
+
+      if (needUsdt) {
         fetchUSDTBalance(addr, net).then(function(bal) {
           state.balanceUSDT[usdtKey] = bal;
-          state.balLoading = false;
-          if (state.currentAddress === addr && state.network === net) renderBalanceGrid(addr);
+          onNetFetchDone();
         }).catch(function(e) {
-          state.balLoading = false;
           console.warn('[KoinQ] fetchUSDTBalance (network switch) failed:', e && e.message);
+          onNetFetchDone();
         });
       }
 
-      // Fetch native balance jika belum ada untuk network ini
-      var nativeCache = net === 'BSC' ? state.balanceBSC[addr] : state.balanceCELO[addr];
-      if (nativeCache === undefined || isNaN(parseFloat(nativeCache))) {
+      if (needNative) {
         fetchBalance(addr, net).then(function(bal) {
           if (net === 'BSC') state.balanceBSC[addr] = bal;
           else state.balanceCELO[addr] = bal;
-          if (state.currentAddress === addr && state.network === net) renderBalanceGrid(addr);
+          onNetFetchDone();
         }).catch(function(e) {
           console.warn('[KoinQ] fetchBalance (network switch) failed:', e && e.message);
+          onNetFetchDone();
         });
       }
 
@@ -1575,6 +1603,10 @@ function setupSendModal() {
     var net    = state.network;
     var wallet = state.wallets[state.currentIndex];
 
+    if (!wallet) {
+      setStatus(statusEl, 'error', '✗ No wallet selected. Please re-login.');
+      return;
+    }
     if (!ethers.isAddress(to)) {
       setStatus(statusEl, 'error', '✗ Invalid recipient address.');
       return;
@@ -1597,15 +1629,14 @@ function setupSendModal() {
     statusEl.appendChild(document.createTextNode(' Simulating transfer…'));
     statusEl.classList.remove('hidden');
 
+    var dryRunTimer;
     try {
       // Timeout 30 detik untuk dry-run agar tidak hang jika RPC lambat
       var estPromise = estimateUSDTTransfer(to, amount, wallet.address, net);
-      var dryRunTimer;
       var timeoutPromise = new Promise(function(_, reject) {
         dryRunTimer = setTimeout(function() { reject(new Error('Request timed out. Check your connection.')); }, 30000);
       });
       var est = await Promise.race([estPromise, timeoutPromise]);
-      clearTimeout(dryRunTimer);
       pendingTx = est;
 
       // Build dry run preview
@@ -1667,9 +1698,10 @@ function setupSendModal() {
                 (typeof err.message === 'string' ? err.message : null) ||
                 'Simulation failed. Check balance or address.';
       setStatus(statusEl, 'error', '✗ ' + msg.slice(0, 120));
+    } finally {
+      clearTimeout(dryRunTimer);
+      dryRunBtn.disabled = false;
     }
-
-    dryRunBtn.disabled = false;
   });
 
   // --- Confirm Send ---
@@ -1677,6 +1709,10 @@ function setupSendModal() {
     if (!pendingTx) return;
 
     var wallet = state.wallets[state.currentIndex];
+    if (!wallet) {
+      setStatus(statusPreview, 'error', '✗ No wallet selected. Please re-login.');
+      return;
+    }
     confirmBtn.disabled = true;
     statusPreview.className = 'modal-info info';
     statusPreview.textContent = '';
@@ -1699,9 +1735,9 @@ function setupSendModal() {
                 (typeof err.message === 'string' ? err.message : null) ||
                 'Transaction failed. Check your USDT and gas balance.';
       setStatus(statusPreview, 'error', '✗ ' + msg.slice(0, 120));
+    } finally {
+      confirmBtn.disabled = false;
     }
-
-    confirmBtn.disabled = false;
   });
 }
 
