@@ -29,10 +29,6 @@ function bfSave(s) {
   try { localStorage.setItem(BF_STORAGE_KEY, JSON.stringify(s)); } catch (e) {}
 }
 
-function bfReset() {
-  try { localStorage.removeItem(BF_STORAGE_KEY); } catch (e) {}
-}
-
 // Cooldown eksponensial: 0, 0, 10s, 30s, 90s, 3m, 9m, 15m, 15m, 15m, lalu lockout 24 jam
 function getUnlockCooldownMs(attempts) {
   if (attempts <= 2) return 0;
@@ -148,7 +144,7 @@ var networks = {
     explorerApi: 'https://api.celoscan.io/api',
     explorerTx: 'https://celoscan.io/tx/',
     explorerAddr: 'https://celoscan.io/address/',
-    usdtAddress: '0x617f3112bf5397D0467D315cC709EF968D9ba546',
+    usdtAddress: '0x48065fbbe25f71c9282ddf5e1cd6d6a887483d5e',
     usdtDecimals: 6
   }
 };
@@ -157,6 +153,8 @@ var networks = {
 var ERC20_ABI = [
   'function balanceOf(address owner) view returns (uint256)',
   'function decimals() view returns (uint8)',
+  'function symbol() view returns (string)',
+  'function name() view returns (string)',
   'function transfer(address to, uint256 amount) returns (bool)'
 ];
 
@@ -207,8 +205,7 @@ async function fetchBalance(address, network) {
   var rpcs = [cfg.rpcUrl].concat(cfg.rpcFallbacks || []);
   for (var i = 0; i < rpcs.length; i++) {
     try {
-      var provider = new ethers.JsonRpcProvider(rpcs[i]);
-      var bal = await provider.getBalance(address);
+      var bal = await new ethers.JsonRpcProvider(rpcs[i]).getBalance(address);
       return ethers.formatEther(bal);
     } catch (e) { /* try next */ }
   }
@@ -222,8 +219,7 @@ async function fetchUSDTBalance(address, network) {
   for (var i = 0; i < rpcs.length; i++) {
     try {
       var provider = new ethers.JsonRpcProvider(rpcs[i]);
-      var contract = new ethers.Contract(cfg.usdtAddress, ERC20_ABI, provider);
-      var bal = await contract.balanceOf(address);
+      var bal = await new ethers.Contract(cfg.usdtAddress, ERC20_ABI, provider).balanceOf(address);
       return ethers.formatUnits(bal, cfg.usdtDecimals);
     } catch (e) { /* try next */ }
   }
@@ -233,101 +229,331 @@ async function fetchUSDTBalance(address, network) {
 // Simulate USDT transfer — returns gas estimate details without sending
 async function estimateUSDTTransfer(to, amount, fromAddress, network) {
   var cfg = networks[network];
-  var provider = new ethers.JsonRpcProvider(cfg.rpcUrl);
-  var contract = new ethers.Contract(cfg.usdtAddress, ERC20_ABI, provider);
-  var amountWei = ethers.parseUnits(amount, cfg.usdtDecimals);
+  var rpcs = [cfg.rpcUrl].concat(cfg.rpcFallbacks || []);
 
-  var [feeData, gasUnits] = await Promise.all([
-    provider.getFeeData(),
-    contract.transfer.estimateGas(to, amountWei, { from: fromAddress })
-  ]);
+  // Prepare amount in token decimals
+  var amountWei;
+  try {
+    amountWei = ethers.parseUnits(amount.toString(), cfg.usdtDecimals);
+  } catch (e) {
+    throw new Error('Invalid amount');
+  }
 
-  var gasPrice = feeData.gasPrice;
-  var gasFeeWei = gasUnits * gasPrice;
+  for (var i = 0; i < rpcs.length; i++) {
+    try {
+      var provider = new ethers.JsonRpcProvider(rpcs[i]);
+      // Create contract and populate transfer tx data (ethers v6 API)
+      var ctr = new ethers.Contract(cfg.usdtAddress, ERC20_ABI, provider);
+      var populated = await ctr.transfer.populateTransaction(to, amountWei);
 
-  return {
-    to: to,
-    amount: amount,
-    amountWei: amountWei,
-    gasUnits: gasUnits.toString(),
-    gasPriceGwei: ethers.formatUnits(gasPrice, 'gwei'),
-    gasFeeNative: ethers.formatEther(gasFeeWei),
-    gasPrice: gasPrice,
-    network: network
-  };
+      // Estimate gas (include `from` so nodes can estimate correctly)
+      var gasEstimate = await provider.estimateGas({ to: cfg.usdtAddress, data: populated.data, from: fromAddress });
+      // ethers v6: use getFeeData() instead of deprecated getGasPrice()
+      var feeData = await provider.getFeeData();
+      var gasPrice = feeData.gasPrice || feeData.maxFeePerGas || BigInt(0);
+
+      var gasUnits = gasEstimate.toString();
+      var gasPriceGwei = Number(ethers.formatUnits(gasPrice, 9));
+      // ethers v6: gasEstimate and gasPrice are BigInt — use * operator
+      var feeNative = ethers.formatUnits(gasEstimate * gasPrice, 18);
+
+      return {
+        to: to,
+        amountWei: amountWei.toString(),
+        network: network,
+        gasUnits: gasUnits,
+        gasPrice: gasPrice.toString(),
+        gasPriceGwei: gasPriceGwei,
+        gasFeeNative: Number(feeNative)
+      };
+    } catch (e) {
+      console.warn('[KoinQ] estimateUSDTTransfer failed for RPC', rpcs[i], e && e.message);
+      // try next RPC
+    }
+  }
+  throw new Error('Gas estimation failed');
 }
 
-// Send USDT via ERC-20 transfer
-async function sendUSDT(to, amountWei, encryptedPrivateKey, network, gasPrice) {
-  var privateKey = await decryptStr(encryptedPrivateKey);
-  var cfg = networks[network];
-  var provider = new ethers.JsonRpcProvider(cfg.rpcUrl);
-  var wallet = new ethers.Wallet(privateKey, provider);
-  privateKey = null; // Clear local reference once Wallet object is created
-  var contract = new ethers.Contract(cfg.usdtAddress, ERC20_ABI, wallet);
-  var tx = await contract.transfer(to, amountWei, { gasPrice: gasPrice });
-  return tx;
-}
-
-// Normalise a tx object so both BSCScan and CeloScan formats work
+// Normalize explorer-style tx objects (generic txlist / Blockscout results)
 function normaliseTx(tx) {
-  return {
-    hash:      tx.hash || tx.transactionHash || '',
-    from:      tx.from || '',
-    to:        tx.to   || tx.contractAddress || '',
-    value:     tx.value || '0',
-    timeStamp: tx.timeStamp || tx.timestamp || '0',
-    isError:   tx.isError || '0'
+  var out = {
+    hash: tx.hash || tx.transactionHash || tx.txHash || tx.transaction_hash || tx.tx_hash || '',
+    from: tx.from || tx.sender || tx.from_address || tx.owner || '',
+    to: tx.to || tx.to_address || tx.recipient || '',
+    value: tx.value || tx.amount || tx.contractValue || '0',
+    timeStamp: parseTimestamp(tx.timeStamp || tx.timestamp || tx.time || tx.blockTimestamp || tx.blockTime),
+    isError: tx.isError || tx.txreceipt_status || tx.status || '0'
   };
+
+  if (tx.tokenDecimal !== undefined && tx.tokenDecimal !== null) out.tokenDecimal = Number(tx.tokenDecimal);
+  if (tx.tokenSymbol) out.tokenSymbol = tx.tokenSymbol;
+  if (tx.contractAddress) out.contract = tx.contractAddress;
+  // leave tokenDecimal undefined when unknown
+
+  return out;
 }
 
-// Fetch last 20 transactions from explorer API
+// Normalize MetaMask Accounts API / modern explorer objects (best-effort)
+function normaliseExplorerTx(tx) {
+  if (!tx) return { hash: '', from: '', to: '', value: '0', timeStamp: String(Math.floor(Date.now() / 1000)) };
+  var out = {};
+  out.hash = tx.hash || tx.txHash || tx.transactionHash || (tx.raw && tx.raw.hash) || '';
+  out.from = tx.from || tx.txFrom || (tx.raw && tx.raw.from) || '';
+  out.to = tx.to || tx.txTo || (tx.raw && tx.raw.to) || '';
+  out.isError = tx.isError || tx.status || '0';
+
+  // Try token transfer shapes
+  if (Array.isArray(tx.valueTransfers) && tx.valueTransfers.length > 0) {
+    var vt = tx.valueTransfers[0];
+    out.value = vt.value || vt.amount || '0';
+    out.tokenSymbol = vt.symbol || vt.tokenSymbol || null;
+    out.tokenDecimal = vt.tokenDecimal !== undefined && vt.tokenDecimal !== null ? Number(vt.tokenDecimal) : null;
+    out.timeStamp = parseTimestamp(vt.time || vt.timeStamp || tx.timeStamp || tx.timestamp);
+    out.contract = vt.contract || vt.contractAddress || null;
+    return out;
+  }
+
+  // Otherwise fall back to simpler fields
+  out.value = tx.value || '0';
+  out.timeStamp = parseTimestamp(tx.timeStamp || tx.timestamp || tx.receivedAt);
+  return out;
+}
+
+// Parse a variety of timestamp formats into unix seconds string
+function parseTimestamp(ts) {
+  if (!ts) return String(Math.floor(Date.now() / 1000));
+  // numeric or numeric string
+  var n = Number(ts);
+  if (!isNaN(n)) {
+    // If timestamp looks like milliseconds (>= 1e12), convert to seconds
+    if (n > 1e12) return String(Math.floor(n / 1000));
+    // If it's already seconds (reasonable range), return as integer string
+    if (n > 1e9) return String(Math.floor(n));
+    // small numbers -> fallback to now
+    return String(Math.floor(Date.now() / 1000));
+  }
+  // Try ISO date parse
+  var parsed = Date.parse(ts);
+  if (!isNaN(parsed)) return String(Math.floor(parsed / 1000));
+  return String(Math.floor(Date.now() / 1000));
+}
+
+// Send USDT: decrypt private key, attach provider for network, and send transfer
+async function sendUSDT(to, amountWei, encryptedPrivateKey, network, gasPrice) {
+  var cfg = networks[network];
+  if (!cfg) throw new Error('Unknown network');
+
+  // Ensure session key exists to decrypt the stored private key
+  if (!sessionEncKey) throw new Error('Session key not initialized');
+
+  // Decrypt private key (stored during wallet creation)
+  var pk = (await decryptStr(encryptedPrivateKey)).trim();
+  if (!pk.startsWith('0x')) pk = '0x' + pk;
+
+  // Prepare provider and signer
+  var provider = new ethers.JsonRpcProvider(cfg.rpcUrl);
+  var wallet = new ethers.Wallet(pk, provider);
+
+  // Connect contract with signer and send transfer
+  var contract = new ethers.Contract(cfg.usdtAddress, ERC20_ABI, wallet);
+
+  var overrides = {};
+  try {
+    if (gasPrice) {
+      // ethers v6: gasPrice must be BigInt; convert from string if needed
+      overrides.gasPrice = BigInt(gasPrice);
+    }
+    // ethers v6: amountWei must be BigInt; convert if stored as string
+    var amountWeiBig = BigInt(amountWei);
+    var txResp = await contract.transfer(to, amountWeiBig, overrides);
+    // Return the transaction response (caller may wait for confirmation)
+    return txResp;
+  } catch (e) {
+    console.warn('[KoinQ] sendUSDT failed', e && e.message);
+    throw e;
+  }
+}
+
+// Fallback: use RPC getLogs to find ERC-20 Transfer events for an address (no API key required)
+async function fetchTransactionsByLogs(address, network) {
+  var cfg = networks[network];
+  var rpcs = [cfg.rpcUrl].concat(cfg.rpcFallbacks || []);
+  var transferTopic = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
+  var results = [];
+
+  for (var i = 0; i < rpcs.length; i++) {
+    try {
+      var provider = new ethers.JsonRpcProvider(rpcs[i]);
+      var latest = await provider.getBlockNumber();
+      var fromBlock = Math.max(0, latest - 50000); // search last ~50k blocks (configurable)
+
+      // Prepare padded topic for address matching (topics[1]=from, topics[2]=to)
+      var addrNo0x = address.toLowerCase().replace(/^0x/, '');
+      var addrTopic = '0x' + addrNo0x.padStart(64, '0');
+
+      // Do NOT hardcode a token contract. Fetch logs across all contracts by omitting `address`.
+      var toFilter = {
+        fromBlock: fromBlock,
+        toBlock: latest,
+        topics: [transferTopic, null, addrTopic]
+      };
+      var fromFilter = {
+        fromBlock: fromBlock,
+        toBlock: latest,
+        topics: [transferTopic, addrTopic]
+      };
+
+      var toLogs = await provider.getLogs(toFilter);
+      var fromLogs = await provider.getLogs(fromFilter);
+
+      var all = toLogs.concat(fromLogs);
+
+      // Collect unique contract addresses to query decimals/symbol later
+      var contracts = {};
+      all.forEach(function(lg) { contracts[lg.address.toLowerCase()] = true; });
+      var contractMeta = {};
+      var contractAddrs = Object.keys(contracts);
+      for (var k = 0; k < contractAddrs.length; k++) {
+        var caddr = contractAddrs[k];
+        try {
+          var ctr = new ethers.Contract(caddr, ERC20_ABI, provider);
+          var dec = await ctr.decimals();
+          var sym = await ctr.symbol();
+          contractMeta[caddr] = { decimals: dec !== undefined ? Number(dec) : null, symbol: sym || null };
+        } catch (e) {
+          contractMeta[caddr] = { decimals: null, symbol: null };
+        }
+      }
+
+      // Deduplicate by txHash+logIndex and build results
+      var seen = {};
+      for (var j = 0; j < all.length; j++) {
+        var lg = all[j];
+        var key = lg.transactionHash + '_' + lg.logIndex;
+        if (seen[key]) continue;
+        seen[key] = true;
+
+        // Parse topics: topics[1]=from, topics[2]=to
+        var fromAddr = '0x' + (lg.topics[1] || '').slice(-40);
+        var toAddr = '0x' + (lg.topics[2] || '').slice(-40);
+        var value = lg.data || '0x0';
+
+        // Fetch block timestamp
+        var blk = await provider.getBlock(lg.blockNumber);
+        var ts = blk && blk.timestamp ? String(blk.timestamp) : String(Date.now() / 1000 | 0);
+
+        var caddrLower = lg.address.toLowerCase();
+        var meta = contractMeta[caddrLower] || { decimals: null, symbol: null };
+
+        results.push({
+          hash: lg.transactionHash,
+          from: fromAddr,
+          to: toAddr,
+          value: value,
+          timeStamp: ts,
+          contractAddress: lg.address,
+          tokenDecimal: meta.decimals,
+          tokenSymbol: meta.symbol
+        });
+      }
+
+      // Sort by block desc
+      results.sort(function(a,b){ return (b.timeStamp || 0) - (a.timeStamp || 0); });
+      return results.map(normaliseTx);
+    } catch (e) {
+      console.warn('[KoinQ] getLogs fallback failed for RPC', rpcs[i], e && e.message);
+      // try next RPC
+    }
+  }
+  return [];
+}
+// Fetch last 20 transactions from explorer API (with CELO Blockscout token endpoint)
 async function fetchTransactions(address, network) {
   var cfg = networks[network];
+
+  // For BSC prefer MetaMask Accounts API (no API key) which returns rich tx objects
+  if (network === 'BSC') {
+    try {
+      var mmUrl = 'https://accounts.api.cx.metamask.io/v1/accounts/' + encodeURIComponent(address) +
+                  '/transactions?networks=0x1,0x89,0x38,0xe708,0x2105,0xa,0xa4b1,0x82750,0x531,0x8f&sortDirection=DESC';
+      console.debug('[KoinQ] Querying MetaMask Accounts API:', mmUrl);
+      var mmRes = await fetch(mmUrl, { mode: 'cors', credentials: 'omit' });
+      if (mmRes.ok) {
+        var mmData = await mmRes.json();
+        if (mmData && Array.isArray(mmData.data) && mmData.data.length > 0) {
+          console.debug('[KoinQ] MetaMask accounts API returned', mmData.data.length, 'txs');
+          return mmData.data.map(normaliseExplorerTx);
+        }
+      }
+    } catch (e) {
+      console.warn('[KoinQ] MetaMask accounts API failed:', e && e.message);
+      // fallthrough to other explorer attempts
+    }
+  }
+
+  // Special handling for CELO: prefer Blockscout token transfers endpoint (tokentx)
+  if (network === 'CELO') {
+    try {
+      // Try Blockscout tokentx without `contractaddress` to list token transfers for the address
+      var blockscoutUrl = 'https://celo.blockscout.com/api?module=account&action=tokentx' +
+                          '&address=' + encodeURIComponent(address) +
+                          '&page=1&offset=20&sort=desc';
+      console.debug('[KoinQ] Attempting Blockscout tokentx:', blockscoutUrl);
+      var res = await fetch(blockscoutUrl, { mode: 'cors', credentials: 'omit' });
+      if (res.ok) {
+        var data = await res.json();
+        console.debug('[KoinQ] Blockscout response:', data && data.result && data.result.length);
+        if (Array.isArray(data.result) && data.result.length > 0) {
+          return data.result.map(normaliseTx);
+        }
+      }
+    } catch (e) {
+      console.warn('Blockscout tokentx failed for CELO:', e && e.message);
+    }
+  }
+
+  // Generic explorer API attempt (BSC / CELO general txlist)
   var api = cfg.explorerApi;
   var url = api + '?module=account&action=txlist&address=' + encodeURIComponent(address) +
             '&startblock=0&endblock=99999999&page=1&offset=20&sort=desc';
   try {
-    var res = await fetch(url, { mode: 'cors', credentials: 'omit' });
-    if (!res.ok) throw new Error('HTTP ' + res.status);
-    var data = await res.json();
-    if (data.status === '1' && Array.isArray(data.result)) {
-      return data.result.map(normaliseTx);
+    var res2 = await fetch(url, { mode: 'cors', credentials: 'omit' });
+    if (!res2.ok) throw new Error('HTTP ' + res2.status);
+    var data2 = await res2.json();
+    // If explorer returns the newer structured format (data array), normalize that
+    if (Array.isArray(data2.data) && data2.data.length > 0) {
+      return data2.data.map(normaliseExplorerTx);
     }
-    // Empty result array regardless of status
-    if (Array.isArray(data.result) && data.result.length === 0) return [];
-    if (data.message === 'No transactions found') return [];
-    throw new Error(data.message || 'empty');
-  } catch (e) {
-    console.warn('Explorer API failed for ' + network + ':', e.message);
-    // For CELO, try Celo Explorer (Blockscout) as fallback
-    if (network === 'CELO') {
-      return await fetchTransactionsCeloFallback(address);
+    if (data2.status === '1' && Array.isArray(data2.result) && data2.result.length > 0) {
+      return data2.result.map(normaliseTx);
     }
-    return null; // null = API failed (distinguished from empty [])
-  }
-}
-
-// Fallback: fetch CELO transactions from Celo Explorer (Blockscout)
-async function fetchTransactionsCeloFallback(address) {
-  var url = 'https://explorer.celo.org/api?module=account&action=txlist&address=' +
-            encodeURIComponent(address) + '&startblock=0&endblock=99999999&page=1&offset=20&sort=desc';
-  try {
-    var res = await fetch(url, { mode: 'cors', credentials: 'omit' });
-    if (!res.ok) throw new Error('HTTP ' + res.status);
-    var data = await res.json();
-    if (data.status === '1' && Array.isArray(data.result)) return data.result.map(normaliseTx);
-    if (Array.isArray(data.result) && data.result.length === 0) return [];
-    if (data.message === 'No transactions found') return [];
-    return null;
+    if (Array.isArray(data2.result) && data2.result.length === 0) return [];
+    if (Array.isArray(data2.data) && data2.data.length === 0) return [];
+    if (data2.message === 'No transactions found') return [];
+    throw new Error(data2.message || 'empty');
   } catch (e) {
-    console.warn('Celo Explorer fallback API failed:', e.message);
-    return null;
+    console.warn('Explorer API failed for ' + network + ':', e && e.message);
+    // If BSC explorer deprecated (NOTOK) or failed, try RPC getLogs fallback (no API key)
+    if (network === 'BSC') {
+      try {
+        return await fetchTransactionsByLogs(address, network);
+      } catch (err) {
+        console.warn('[KoinQ] getLogs fallback also failed:', err && err.message);
+      }
+    }
+    return [];
   }
 }
 
 /* ===== DOM Helpers ===== */
 function $(id) { return document.getElementById(id); }
+
+// Create a spinner <span> element
+function makeSpinner() {
+  var sp = document.createElement('span');
+  sp.className = 'spinner';
+  return sp;
+}
 
 function showToast(msg, type) {
   var container = $('toast-container');
@@ -347,6 +573,7 @@ function copyText(text) {
 }
 
 function shortenAddress(addr) {
+  if (!addr || addr.length < 10) return addr || '–';
   return addr.slice(0, 6) + '…' + addr.slice(-4);
 }
 
@@ -362,6 +589,18 @@ function timeAgo(ts) {
   if (diff < 3600) return Math.floor(diff / 60) + 'm ago';
   if (diff < 86400) return Math.floor(diff / 3600) + 'h ago';
   return Math.floor(diff / 86400) + 'd ago';
+}
+
+// Try each RPC in order, return first working JsonRpcProvider
+async function makeProvider(rpcs) {
+  for (var i = 0; i < rpcs.length; i++) {
+    try {
+      var p = new ethers.JsonRpcProvider(rpcs[i]);
+      await p.getBlockNumber(); // quick connectivity check
+      return p;
+    } catch (e) { /* try next */ }
+  }
+  throw new Error('All RPC endpoints failed');
 }
 
 /* ===== Screen Management ===== */
@@ -409,12 +648,23 @@ function setupLogin() {
       tabUpload.classList.remove('active');
       panelManual.style.display = 'block';
       panelUpload.style.display = 'none';
+      // Ensure manual input is focusable when tab is opened
+      try { manualInput.disabled = false; manualInput.focus(); } catch (e) {}
     }
     errEl.classList.add('hidden');
   }
 
   tabUpload.addEventListener('click', function() { switchTab('upload'); });
   tabManual.addEventListener('click', function() { switchTab('manual'); });
+
+  // Make clicking the manual panel focus the input (helps if UI overlays overlap)
+  try {
+    panelManual.addEventListener('click', function(e) {
+      if (e.target === panelManual || e.target.classList.contains('input')) {
+        try { manualInput.focus(); } catch (err) {}
+      }
+    });
+  } catch (e) {}
 
   // --- File selection handler ---
   function handleFile(file) {
@@ -577,9 +827,7 @@ function setupLogin() {
     errEl.classList.add('hidden');
     unlockBtn.disabled = true;
     unlockBtn.textContent = '';
-    var sp = document.createElement('span');
-    sp.className = 'spinner';
-    unlockBtn.appendChild(sp);
+    unlockBtn.appendChild(makeSpinner());
     unlockBtn.appendChild(document.createTextNode(' Computing wallet…'));
 
     // Hitung attempt dan set cooldown SEBELUM proses — persist ke localStorage
@@ -656,6 +904,7 @@ function renderDashboard() {
 function renderSidebar() {
   var list = $('wallet-list');
   list.innerHTML = '';
+
   state.wallets.forEach(function(w, i) {
     var item = document.createElement('div');
     item.className = 'wallet-item' + (i === state.currentIndex ? ' active' : '');
@@ -795,7 +1044,7 @@ function renderTransactions() {
     return;
   }
 
-  if (state.transactions === null) {
+  if (!state.transactions) {
     list.innerHTML = '';
     var errDiv = document.createElement('div');
     errDiv.className = 'tx-empty';
@@ -829,9 +1078,21 @@ function renderTransactions() {
 
   state.transactions.forEach(function(tx) {
     var isIn = tx.to && tx.to.toLowerCase() === addr.toLowerCase();
-    var amountEth = ethers.formatEther(tx.value || '0');
-    var amountFmt = formatAmount(amountEth);
-    var sym       = networks[net].symbol;
+    // Determine display amount and symbol: prefer token info (e.g., USDT) when present
+    var displayAmountRaw = '0';
+    var displaySym = networks[net].symbol;
+    if (tx.tokenSymbol) {
+      // token transfer: use provided decimals, fallback to network USDT decimals
+      var dec = (tx.tokenDecimal != null) ? tx.tokenDecimal : (networks[net].usdtDecimals || 18);
+      try { displayAmountRaw = ethers.formatUnits(tx.value || '0', dec); }
+      catch (e) { displayAmountRaw = (Number(tx.value || 0) / Math.pow(10, dec)).toString(); }
+      displaySym = tx.tokenSymbol;
+    } else {
+      // native transfer (wei)
+      try { displayAmountRaw = ethers.formatEther(tx.value || '0'); }
+      catch (e) { displayAmountRaw = '0'; }
+    }
+    var amountFmt = formatAmount(displayAmountRaw);
     var explorerUrl = networks[net].explorerTx + tx.hash;
 
     var row = document.createElement('div');
@@ -875,7 +1136,7 @@ function renderTransactions() {
     // Amount
     var cellAmt = document.createElement('div');
     cellAmt.className = 'tx-cell tx-cell-amount ' + (isIn ? 'text-green' : 'text-danger');
-    cellAmt.textContent = (isIn ? '+' : '-') + amountFmt + ' ' + sym;
+    cellAmt.textContent = (isIn ? '+' : '-') + amountFmt + ' ' + displaySym;
     if (tx.isError === '1') { cellAmt.textContent = 'Failed'; cellAmt.className = 'tx-cell tx-cell-amount tx-failed'; }
 
     // Detail link
@@ -937,6 +1198,9 @@ async function loadTransactions(address) {
 
   var txs = await fetchTransactions(address, state.network);
   // null = API error, [] = no txs found, array = results
+  if (Array.isArray(txs)) {
+    txs.sort(function(a, b) { return (Number(b.timeStamp) || 0) - (Number(a.timeStamp) || 0); });
+  }
   state.transactions = txs;
   state.txLoading = false;
 
@@ -1074,9 +1338,7 @@ function setupSendModal() {
     dryRunBtn.disabled = true;
     statusEl.className = 'modal-info info';
     statusEl.textContent = '';
-    var spDry = document.createElement('span');
-    spDry.className = 'spinner';
-    statusEl.appendChild(spDry);
+    statusEl.appendChild(makeSpinner());
     statusEl.appendChild(document.createTextNode(' Simulating transfer…'));
     statusEl.classList.remove('hidden');
 
@@ -1137,9 +1399,7 @@ function setupSendModal() {
     confirmBtn.disabled = true;
     statusPreview.className = 'modal-info info';
     statusPreview.textContent = '';
-    var spSend = document.createElement('span');
-    spSend.className = 'spinner';
-    statusPreview.appendChild(spSend);
+    statusPreview.appendChild(makeSpinner());
     statusPreview.appendChild(document.createTextNode(' Sending USDT…'));
     statusPreview.classList.remove('hidden');
 
@@ -1179,34 +1439,34 @@ function setupBackBtn() {
 /* ===== Logout ===== */
 function setupLogout() {
   $('logout-btn').addEventListener('click', function() {
+    // Clear sensitive state
     state.encryptedMnemonic = null;
-    state.wallets  = [];
-    state.currentAddress = '';
-    state.transactions = [];
-    state.balanceBSC  = {};
-    state.balanceCELO = {};
-    state.balanceUSDT = {};
-    sessionEncKey = null;
+    state.wallets           = [];
+    state.currentAddress    = '';
+    state.transactions      = [];
+    state.balanceBSC        = {};
+    state.balanceCELO       = {};
+    state.balanceUSDT       = {};
+    sessionEncKey           = null;
+
+    // Reset login UI
     $('password-input').value = '';
     $('login-error').classList.add('hidden');
-    // Reset file selection UI
-    var fileInput = $('key-file-input');
-    if (fileInput) fileInput.value = '';
-    var selInfo = $('file-selected-info');
-    var dropContent = $('file-drop-content');
-    if (selInfo) selInfo.style.display = 'none';
-    if (dropContent) dropContent.style.display = 'flex';
-    var copyHBtn = $('copy-hash-btn');
-    if (copyHBtn) copyHBtn.classList.add('hidden');
-    var manualInp = $('manual-hash-input');
-    if (manualInp) manualInp.value = '';
-    var manualHnt = $('manual-hash-hint');
-    if (manualHnt) { manualHnt.textContent = ''; manualHnt.className = 'hash-hint-msg'; }
-    // Reset ke tab upload
-    var tabUp = $('tab-upload'); var tabMn = $('tab-manual');
-    var panUp = $('panel-upload'); var panMn = $('panel-manual');
-    if (tabUp && tabMn) { tabUp.classList.add('active'); tabMn.classList.remove('active'); }
-    if (panUp && panMn) { panUp.style.display = 'block'; panMn.style.display = 'none'; }
+    $('key-file-input').value = '';
+    $('file-selected-info').style.display = 'none';
+    $('file-drop-content').style.display  = 'flex';
+    $('copy-hash-btn').classList.add('hidden');
+    $('manual-hash-input').value = '';
+    var hint = $('manual-hash-hint');
+    hint.textContent = '';
+    hint.className   = 'hash-hint-msg';
+
+    // Reset to upload tab
+    $('tab-upload').classList.add('active');
+    $('tab-manual').classList.remove('active');
+    $('panel-upload').style.display = 'block';
+    $('panel-manual').style.display = 'none';
+
     showScreen('login-screen');
   });
 }
@@ -1302,9 +1562,7 @@ function setupPhraseModal() {
 
     confirmBtn.disabled = true;
     confirmBtn.textContent = '';
-    var sp = document.createElement('span');
-    sp.className = 'spinner';
-    confirmBtn.appendChild(sp);
+    confirmBtn.appendChild(makeSpinner());
     confirmBtn.appendChild(document.createTextNode(' Verifying…'));
 
     try {
