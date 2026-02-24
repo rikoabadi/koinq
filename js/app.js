@@ -145,7 +145,12 @@ var networks = {
     explorerTx: 'https://celoscan.io/tx/',
     explorerAddr: 'https://celoscan.io/address/',
     usdtAddress: '0x48065fbbe25f71c9282ddf5e1cd6d6a887483d5e',
-    usdtDecimals: 6
+    usdtDecimals: 6,
+    // CIP-64: USDT butuh adapter karena 6 decimals (bukan token address langsung)
+    // Adapter menormalisasi ke 18 decimals agar protokol CELO bisa hitung gas
+    // Ref: https://docs.celo.org/developer/fee-currency
+    feeCurrency: '0x0e2a3e05bc9a16f5292a6170456a710cb89c6f72', // USDT Adapter (bukan USDT!)
+    feeCurrencySymbol: 'USDT'
   }
 };
 
@@ -239,36 +244,76 @@ async function estimateUSDTTransfer(to, amount, fromAddress, network) {
     throw new Error('Invalid amount');
   }
 
+  // CIP-64: CELO L2 mendukung fee abstraction — gas dibayar pakai token ERC-20
+  var hasCip64 = !!(cfg.feeCurrency);
+
   for (var i = 0; i < rpcs.length; i++) {
     try {
       var provider = new ethers.JsonRpcProvider(rpcs[i]);
-      // Create contract and populate transfer tx data (ethers v6 API)
       var ctr = new ethers.Contract(cfg.usdtAddress, ERC20_ABI, provider);
       var populated = await ctr.transfer.populateTransaction(to, amountWei);
 
-      // Estimate gas (include `from` so nodes can estimate correctly)
-      var gasEstimate = await provider.estimateGas({ to: cfg.usdtAddress, data: populated.data, from: fromAddress });
-      // ethers v6: use getFeeData() instead of deprecated getGasPrice()
-      var feeData = await provider.getFeeData();
-      var gasPrice = feeData.gasPrice || feeData.maxFeePerGas || BigInt(0);
+      var gasEstimate, feeData, gasPrice;
 
-      var gasUnits = gasEstimate.toString();
-      var gasPriceGwei = Number(ethers.formatUnits(gasPrice, 9));
-      // ethers v6: gasEstimate and gasPrice are BigInt — use * operator
-      var feeNative = ethers.formatUnits(gasEstimate * gasPrice, 18);
+      if (hasCip64) {
+        // CIP-64: gasPrice harus diambil spesifik untuk fee currency via eth_gasPrice(adapterAddress)
+        // Karena USDT = 6 dec, node CELO mengembalikan gasPrice dalam 18-dec normalized via adapter
+        var gpHex;
+        try {
+          gpHex = await provider.send('eth_gasPrice', [cfg.feeCurrency]);
+        } catch (e2) {
+          // Fallback jika node tidak support parameter feeCurrency di eth_gasPrice
+          var fd = await provider.getFeeData();
+          gpHex = '0x' + (fd.gasPrice || fd.maxFeePerGas || BigInt(0)).toString(16);
+        }
+        gasPrice = BigInt(gpHex);
+
+        // eth_estimateGas dengan feeCurrency = estimasi akurat termasuk overhead adapter
+        // PENTING: provider.estimateGas() ethers.js TIDAK meneruskan feeCurrency ke RPC
+        // Harus pakai provider.send('eth_estimateGas') agar field feeCurrency dikirim
+        try {
+          var gasHex = await provider.send('eth_estimateGas', [{ to: cfg.usdtAddress, data: populated.data, from: fromAddress, feeCurrency: cfg.feeCurrency }]);
+          gasEstimate = BigInt(gasHex);
+        } catch (e3) {
+          // fallback tanpa feeCurrency jika node tidak support
+          gasEstimate = await provider.estimateGas({ to: cfg.usdtAddress, data: populated.data, from: fromAddress });
+        }
+        gasEstimate = gasEstimate * BigInt(120) / BigInt(100);
+
+        // gasFeeWei = gasUsed × gasPriceWei (keduanya dalam 18-dec)
+        // gasFeeCELO = gasFeeWei / 1e18
+        var gasFeeWei  = gasEstimate * gasPrice;
+        var gasFeeCelo = Number(ethers.formatUnits(gasFeeWei, 18));
+
+        return {
+          to:                  to,
+          amountWei:           amountWei.toString(),
+          network:             network,
+          gasUnits:            gasEstimate.toString(),
+          gasPrice:            gasPrice.toString(),
+          gasPriceGwei:        Number(ethers.formatUnits(gasPrice, 9)),
+          gasFeeNative:        gasFeeCelo,   // dalam CELO, 18 dec
+          feeCurrency:         cfg.feeCurrency,
+          feeCurrencySymbol:   cfg.feeCurrencySymbol
+        };
+      }
+
+      // BSC / jaringan standar — gas dibayar native token
+      gasEstimate = await provider.estimateGas({ to: cfg.usdtAddress, data: populated.data, from: fromAddress });
+      feeData     = await provider.getFeeData();
+      gasPrice    = feeData.gasPrice || feeData.maxFeePerGas || BigInt(0);
 
       return {
-        to: to,
-        amountWei: amountWei.toString(),
-        network: network,
-        gasUnits: gasUnits,
-        gasPrice: gasPrice.toString(),
-        gasPriceGwei: gasPriceGwei,
-        gasFeeNative: Number(feeNative)
+        to:           to,
+        amountWei:    amountWei.toString(),
+        network:      network,
+        gasUnits:     gasEstimate.toString(),
+        gasPrice:     gasPrice.toString(),
+        gasPriceGwei: Number(ethers.formatUnits(gasPrice, 9)),
+        gasFeeNative: Number(ethers.formatUnits(gasEstimate * gasPrice, 18))
       };
     } catch (e) {
       console.warn('[KoinQ] estimateUSDTTransfer failed for RPC', rpcs[i], e && e.message);
-      // try next RPC
     }
   }
   throw new Error('Gas estimation failed');
@@ -338,35 +383,258 @@ function parseTimestamp(ts) {
   return String(Math.floor(Date.now() / 1000));
 }
 
+// Encode satu nilai RLP: bytes atau integer sebagai BigInt/number
+// Encode satu nilai RLP bytes (bukan integer 0 = kosong, tapi address/data/sig bytes)
+function rlpEncodeBytes(value) {
+  var bytes;
+  if (value === '0x' || value === '' || value === null || value === undefined) {
+    bytes = new Uint8Array(0);
+  } else if (typeof value === 'string') {
+    var s = value.startsWith('0x') ? value.slice(2) : value;
+    if (s === '') { bytes = new Uint8Array(0); }
+    else {
+      if (s.length % 2) s = '0' + s;
+      bytes = new Uint8Array(s.match(/.{2}/g).map(function(b) { return parseInt(b, 16); }));
+    }
+  } else if (value instanceof Uint8Array) {
+    bytes = value;
+  } else {
+    bytes = new Uint8Array(0);
+  }
+  if (bytes.length === 1 && bytes[0] < 0x80) return bytes;
+  var prefix;
+  if (bytes.length <= 55) {
+    prefix = new Uint8Array([0x80 + bytes.length]);
+  } else {
+    var lenHex = bytes.length.toString(16);
+    if (lenHex.length % 2) lenHex = '0' + lenHex;
+    var lenBytes = new Uint8Array(lenHex.match(/.{2}/g).map(function(b) { return parseInt(b, 16); }));
+    prefix = new Uint8Array([0xb7 + lenBytes.length].concat(Array.from(lenBytes)));
+  }
+  var out = new Uint8Array(prefix.length + bytes.length);
+  out.set(prefix); out.set(bytes, prefix.length);
+  return out;
+}
+
+// Encode integer sebagai RLP (BigInt/number) — 0 → 0x80 (empty), n → minimal bytes
+function rlpEncodeInt(n) {
+  var bn = BigInt(n);
+  if (bn === BigInt(0)) return new Uint8Array([0x80]); // RLP integer 0 = empty = 0x80
+  var hex = bn.toString(16);
+  if (hex.length % 2) hex = '0' + hex;
+  var bytes = new Uint8Array(hex.match(/.{2}/g).map(function(b) { return parseInt(b, 16); }));
+  if (bytes.length === 1 && bytes[0] < 0x80) return bytes; // single byte < 0x80: no prefix
+  var prefix = new Uint8Array([0x80 + bytes.length]);
+  var out = new Uint8Array(prefix.length + bytes.length);
+  out.set(prefix); out.set(bytes, prefix.length);
+  return out;
+}
+
+// Encode satu item RLP — dispatch berdasarkan tipe
+function rlpEncodeItem(value) {
+  if (Array.isArray(value)) return rlpEncodeList(value);  // nested list
+  if (typeof value === 'bigint' || typeof value === 'number') return rlpEncodeInt(value);
+  return rlpEncodeBytes(value); // string hex atau Uint8Array
+}
+
+// Encode signature scalar (r atau s): 32-byte fixed, strip leading zeros untuk RLP integer
+// RLP integer tidak boleh ada leading zero bytes
+function rlpEncodeScalar(hexStr) {
+  var s = hexStr.startsWith('0x') ? hexStr.slice(2) : hexStr;
+  while (s.length < 64) s = '0' + s;   // pastikan 32 bytes dulu
+  // strip leading zero bytes (RLP integer tidak boleh leading zeros)
+  s = s.replace(/^(00)+/, '') || '00';
+  if (s.length % 2) s = '0' + s;
+  if (s === '00') return new Uint8Array([0x80]); // zero
+  var bytes = new Uint8Array(s.match(/.{2}/g).map(function(b) { return parseInt(b, 16); }));
+  if (bytes.length === 1 && bytes[0] < 0x80) return bytes;
+  var prefix = new Uint8Array([0x80 + bytes.length]);
+  var out = new Uint8Array(prefix.length + bytes.length);
+  out.set(prefix); out.set(bytes, prefix.length);
+  return out;
+}
+
+// Encode daftar item sebagai RLP list
+function rlpEncodeList(items) {
+  var encoded = items.map(rlpEncodeItem);
+  var total = encoded.reduce(function(s, e) { return s + e.length; }, 0);
+  var prefix;
+  if (total <= 55) {
+    prefix = new Uint8Array([0xc0 + total]);
+  } else {
+    var lenHex = total.toString(16);
+    if (lenHex.length % 2) lenHex = '0' + lenHex;
+    var lenBytes = new Uint8Array(lenHex.match(/.{2}/g).map(function(b) { return parseInt(b, 16); }));
+    prefix = new Uint8Array([0xf7 + lenBytes.length].concat(Array.from(lenBytes)));
+  }
+  var out = new Uint8Array(prefix.length + total);
+  out.set(prefix);
+  var offset = prefix.length;
+  encoded.forEach(function(e) { out.set(e, offset); offset += e.length; });
+  return out;
+}
+
+// Uint8Array → hex string dengan prefix 0x
+function bytesToHex(bytes) {
+  return '0x' + Array.from(bytes).map(function(b) { return b.toString(16).padStart(2, '0'); }).join('');
+}
+
+// Sign digest dengan private key menggunakan ethers SigningKey
+async function ecSign(digestHex, privateKeyHex) {
+  var signingKey = new ethers.SigningKey(privateKeyHex);
+  var sig = signingKey.sign(digestHex);
+  return { r: sig.r, s: sig.s, v: sig.v, yParity: sig.yParity };
+}
+
 // Send USDT: decrypt private key, attach provider for network, and send transfer
-async function sendUSDT(to, amountWei, encryptedPrivateKey, network, gasPrice) {
+// Untuk CELO CIP-64: encode RLP manual (type 0x7b=123) karena ethers v6 tidak support feeCurrency
+// Ref: https://docs.celo.org/developer/fee-currency  (ethers.js not supported natively)
+async function sendUSDT(to, amountWei, encryptedPrivateKey, network, gasPrice, feeCurrency) {
   var cfg = networks[network];
   if (!cfg) throw new Error('Unknown network');
-
-  // Ensure session key exists to decrypt the stored private key
   if (!sessionEncKey) throw new Error('Session key not initialized');
 
-  // Decrypt private key (stored during wallet creation)
   var pk = (await decryptStr(encryptedPrivateKey)).trim();
   if (!pk.startsWith('0x')) pk = '0x' + pk;
 
-  // Prepare provider and signer
   var provider = new ethers.JsonRpcProvider(cfg.rpcUrl);
-  var wallet = new ethers.Wallet(pk, provider);
-
-  // Connect contract with signer and send transfer
+  var wallet   = new ethers.Wallet(pk, provider);
   var contract = new ethers.Contract(cfg.usdtAddress, ERC20_ABI, wallet);
 
-  var overrides = {};
   try {
-    if (gasPrice) {
-      // ethers v6: gasPrice must be BigInt; convert from string if needed
-      overrides.gasPrice = BigInt(gasPrice);
+    if (feeCurrency && network === 'CELO') {
+      // === CIP-64: Transaction Type 123 (0x7b) ===
+      // Format BENAR dari dokumentasi resmi CELO:
+      // 0x7b || RLP([chainId, nonce, maxPriorityFeePerGas, maxFeePerGas, gasLimit,
+      //              to, value, data, accessList, feeCurrency,
+      //              signatureYParity, signatureR, signatureS])
+      // CATATAN: feeCurrency ada di AKHIR setelah accessList, bukan di tengah!
+
+      var populated = await contract.transfer.populateTransaction(to, BigInt(amountWei));
+
+      var nonce = await provider.getTransactionCount(wallet.address, 'pending');
+
+      // Selalu ambil gasPrice fresh saat kirim — nilai dry-run bisa stale (harga gas berubah)
+      var gpCip64;
+      try {
+        var gpHex = await provider.send('eth_gasPrice', [feeCurrency]);
+        gpCip64 = BigInt(gpHex);
+      } catch (e2) {
+        var fd2 = await provider.getFeeData();
+        gpCip64 = fd2.gasPrice || fd2.maxFeePerGas || BigInt(0);
+      }
+      // CIP-64 type 0x7b: maxFee = maxPrio = gasPrice dari adapter
+      // (tidak pakai EIP-1559 split karena CELO L2 masih menggunakan single gasPrice model)
+      var maxFee  = gpCip64;
+      var maxPrio = gpCip64;
+
+      // eth_estimateGas dengan feeCurrency = estimasi akurat termasuk overhead adapter
+      // PENTING: provider.estimateGas() ethers.js TIDAK meneruskan feeCurrency ke RPC
+      // Harus pakai provider.send('eth_estimateGas') agar field feeCurrency dikirim
+      var gasLimit;
+      try {
+        var gasLimitHex = await provider.send('eth_estimateGas', [{ to: cfg.usdtAddress, data: populated.data, from: wallet.address, feeCurrency: feeCurrency }]);
+        gasLimit = BigInt(gasLimitHex);
+      } catch (e3) {
+        gasLimit = await provider.estimateGas({ to: cfg.usdtAddress, data: populated.data, from: wallet.address });
+      }
+      gasLimit = gasLimit * BigInt(120) / BigInt(100);
+
+      var chainId = BigInt(cfg.chainId);
+      console.debug('[KoinQ] CIP-64 params — nonce:', nonce, 'maxFee:', maxFee.toString(), 'gasLimit:', gasLimit.toString());
+
+      // 1. Signing payload (tanpa signature)
+      var signingPayload = rlpEncodeList([
+        chainId,          // BigInt
+        nonce,            // number → BigInt via rlpEncodeInt
+        maxPrio,          // BigInt
+        maxFee,           // BigInt
+        gasLimit,         // BigInt
+        cfg.usdtAddress,  // to: hex string (kontrak USDT)
+        '0x',             // value = 0 CELO → empty bytes
+        populated.data,   // calldata
+        [],               // accessList = empty list
+        feeCurrency       // adapter address — TERAKHIR setelah accessList
+      ]);
+
+      // 2. Prefix type 0x7b
+      var typedPayload = new Uint8Array(1 + signingPayload.length);
+      typedPayload[0] = 0x7b;
+      typedPayload.set(signingPayload, 1);
+
+      // 3. keccak256 digest
+      var digestHex = ethers.keccak256(typedPayload);
+      console.debug('[KoinQ] CIP-64 digest:', digestHex);
+
+      // 4. Sign
+      var sig = await ecSign(digestHex, pk);
+      // ethers v6 Signature memiliki .yParity (0 atau 1) dan .v (27/28)
+      // Gunakan yParity langsung jika tersedia, fallback ke v
+      var yParity = (sig.yParity !== undefined) ? sig.yParity : ((sig.v === 27 || sig.v === 0) ? 0 : 1);
+      console.debug('[KoinQ] CIP-64 sig v:', sig.v, 'yParity:', yParity, 'r:', sig.r.slice(0,10), 's:', sig.s.slice(0,10));
+
+      // 5. Encode tx final dengan signature
+      // yParity: RLP integer (BigInt) — 0 → 0x80 (RLP empty/zero), 1 → 0x01
+      // r, s: RLP integer, strip leading zeros (sesuai RLP spec)
+      var yParityEncoded = rlpEncodeInt(yParity);
+      console.debug('[KoinQ] CIP-64 calldata len:', populated.data ? populated.data.length : 'undefined');
+      console.debug('[KoinQ] CIP-64 calldata prefix:', populated.data ? populated.data.slice(0, 10) : 'n/a');
+
+      // Encode manual tiap field signature lalu concat ke list
+      var listItems = [
+        chainId,
+        nonce,
+        maxPrio,
+        maxFee,
+        gasLimit,
+        cfg.usdtAddress,  // to
+        '0x',             // value = 0
+        populated.data,
+        [],               // accessList
+        feeCurrency       // adapter — setelah accessList
+      ];
+
+      // Encode semua item kecuali sig
+      var encodedItems = listItems.map(rlpEncodeItem);
+      // Tambahkan yParity, r, s
+      encodedItems.push(yParityEncoded);
+      encodedItems.push(rlpEncodeScalar(sig.r));
+      encodedItems.push(rlpEncodeScalar(sig.s));
+
+      // Buat list dari encoded items
+      var total = encodedItems.reduce(function(s, e) { return s + e.length; }, 0);
+      var listPrefix;
+      if (total <= 55) {
+        listPrefix = new Uint8Array([0xc0 + total]);
+      } else {
+        var lenHex2 = total.toString(16);
+        if (lenHex2.length % 2) lenHex2 = '0' + lenHex2;
+        var lenBytes2 = new Uint8Array(lenHex2.match(/.{2}/g).map(function(b) { return parseInt(b, 16); }));
+        listPrefix = new Uint8Array([0xf7 + lenBytes2.length].concat(Array.from(lenBytes2)));
+      }
+      var txPayload = new Uint8Array(listPrefix.length + total);
+      txPayload.set(listPrefix);
+      var off = listPrefix.length;
+      encodedItems.forEach(function(e) { txPayload.set(e, off); off += e.length; });
+
+      var finalTx = new Uint8Array(1 + txPayload.length);
+      finalTx[0] = 0x7b;
+      finalTx.set(txPayload, 1);
+
+      var rawHex = bytesToHex(finalTx);
+      console.debug('[KoinQ] CIP-64 rawTx length:', rawHex.length, 'hex (first 100):', rawHex.slice(0, 100));
+      console.debug('[KoinQ] CIP-64 rawTx full:', rawHex);
+
+      var txHash = await provider.send('eth_sendRawTransaction', [rawHex]);
+      console.debug('[KoinQ] CIP-64 txHash:', txHash);
+      return { hash: txHash };
     }
-    // ethers v6: amountWei must be BigInt; convert if stored as string
-    var amountWeiBig = BigInt(amountWei);
-    var txResp = await contract.transfer(to, amountWeiBig, overrides);
-    // Return the transaction response (caller may wait for confirmation)
+
+    // BSC / CELO tanpa CIP-64 — gasPrice selalu fresh dari network agar tx tidak stuck
+    var feeDataLive = await provider.getFeeData();
+    var liveFee = feeDataLive.gasPrice || feeDataLive.maxFeePerGas || BigInt(0);
+    var overrides = { gasPrice: liveFee };
+    var txResp = await contract.transfer(to, BigInt(amountWei), overrides);
     return txResp;
   } catch (e) {
     console.warn('[KoinQ] sendUSDT failed', e && e.message);
@@ -589,18 +857,6 @@ function timeAgo(ts) {
   if (diff < 3600) return Math.floor(diff / 60) + 'm ago';
   if (diff < 86400) return Math.floor(diff / 3600) + 'h ago';
   return Math.floor(diff / 86400) + 'd ago';
-}
-
-// Try each RPC in order, return first working JsonRpcProvider
-async function makeProvider(rpcs) {
-  for (var i = 0; i < rpcs.length; i++) {
-    try {
-      var p = new ethers.JsonRpcProvider(rpcs[i]);
-      await p.getBlockNumber(); // quick connectivity check
-      return p;
-    } catch (e) { /* try next */ }
-  }
-  throw new Error('All RPC endpoints failed');
 }
 
 /* ===== Screen Management ===== */
@@ -1044,15 +1300,6 @@ function renderTransactions() {
     return;
   }
 
-  if (!state.transactions) {
-    list.innerHTML = '';
-    var errDiv = document.createElement('div');
-    errDiv.className = 'tx-empty';
-    errDiv.innerHTML = '⚠️ Explorer API unavailable.<br/><small>Check your connection or try again later.</small>';
-    list.appendChild(errDiv);
-    return;
-  }
-
   if (!state.transactions || state.transactions.length === 0) {
     list.innerHTML = '';
     var emptyDiv = document.createElement('div');
@@ -1167,6 +1414,7 @@ async function loadAddressData(address) {
   loadTransactions(address);
 }
 
+// Fetch native + USDT balance untuk network aktif saja (efisien, tidak fetch semua network)
 async function loadBalances(address) {
   state.balLoading = true;
   if (state.currentAddress === address) renderMainPanel();
@@ -1174,15 +1422,18 @@ async function loadBalances(address) {
   var net = state.network;
   var usdtKey = address + '_' + net;
 
+  // Fetch native balance network aktif + USDT network aktif secara paralel
   var results = await Promise.all([
-    fetchBalance(address, 'BSC'),
-    fetchBalance(address, 'CELO'),
+    fetchBalance(address, net),
     fetchUSDTBalance(address, net)
   ]);
 
-  state.balanceBSC[address]   = results[0];
-  state.balanceCELO[address]  = results[1];
-  state.balanceUSDT[usdtKey]  = results[2];
+  if (net === 'BSC') {
+    state.balanceBSC[address] = results[0];
+  } else {
+    state.balanceCELO[address] = results[0];
+  }
+  state.balanceUSDT[usdtKey] = results[1];
   state.balLoading = false;
 
   if (state.currentAddress === address) {
@@ -1236,11 +1487,15 @@ function setupNetworkSwitcher() {
             if (state.currentAddress === addr) renderBalanceGrid(addr);
           });
         }
-        // Re-fetch CELO native balance if missing or previously failed
-        if (net === 'CELO' && isNaN(parseFloat(state.balanceCELO[addr]))) {
-          fetchBalance(addr, 'CELO').then(function(bal) {
-            state.balanceCELO[addr] = bal;
-            if (state.currentAddress === addr && state.network === 'CELO') renderBalanceGrid(addr);
+        // Fetch native balance untuk network aktif jika belum ada
+        var nativeMissing = net === 'BSC'
+          ? isNaN(parseFloat(state.balanceBSC[addr]))
+          : isNaN(parseFloat(state.balanceCELO[addr]));
+        if (nativeMissing) {
+          fetchBalance(addr, net).then(function(bal) {
+            if (net === 'BSC') state.balanceBSC[addr] = bal;
+            else state.balanceCELO[addr] = bal;
+            if (state.currentAddress === addr && state.network === net) renderBalanceGrid(addr);
           });
         }
         loadTransactions(addr);
@@ -1350,15 +1605,23 @@ function setupSendModal() {
       var box = $('dry-run-result');
       box.innerHTML = '';
 
+      // Satuan gas fee sesuai network
+      var feeLabel = 'Est. Gas Fee';
+      // CIP-64: gas dihitung dalam CELO (native) tapi dipotong ekuivalen dari USDT
+      // Tampilkan simbol feeCurrencySymbol (USDT) agar user tahu dipotong dari USDT
+      var feeDisplay = est.feeCurrency
+        ? (+est.gasFeeNative).toFixed(6) + ' CELO (≈ dari ' + (est.feeCurrencySymbol || 'USDT') + ')'
+        : (+est.gasFeeNative).toFixed(6) + ' ' + networks[net].symbol; // BSC: fee dalam BNB
+
       var rows = [
-        ['Token',          'USDT'],
-        ['Network',        networks[net].name],
-        ['From',           shortenAddress(wallet.address)],
-        ['To',             shortenAddress(to)],
-        ['Amount',         amount + ' USDT'],
-        ['Gas Units',      parseInt(est.gasUnits, 10).toLocaleString()],
-        ['Gas Price',      (+est.gasPriceGwei).toFixed(4) + ' Gwei'],
-        ['Est. Network Fee', (+est.gasFeeNative).toFixed(8) + ' ' + networks[net].symbol]
+        ['Token',       'USDT'],
+        ['Network',     networks[net].name],
+        ['From',        shortenAddress(wallet.address)],
+        ['To',          shortenAddress(to)],
+        ['Amount',      amount + ' USDT'],
+        ['Gas Units',   parseInt(est.gasUnits, 10).toLocaleString()],
+        ['Gas Price',   (+est.gasPriceGwei).toFixed(4) + ' Gwei'],
+        [feeLabel,      feeDisplay]
       ];
 
       var table = document.createElement('table');
@@ -1376,7 +1639,16 @@ function setupSendModal() {
 
       var note = document.createElement('p');
       note.className = 'dry-run-note';
-      note.textContent = '⚠ Network fees are paid in ' + networks[net].symbol + '. Make sure your wallet has enough ' + networks[net].symbol + ' for gas.';
+      if (est.feeCurrency) {
+        // CELO L2 CIP-64: gas dihitung dalam CELO, tapi dipotong otomatis dari saldo USDT
+        // User tidak perlu pegang CELO — ekuivalen CELO akan dikurangi dari USDT
+        note.innerHTML = '✅ <strong>CELO L2 (CIP-64)</strong>: Gas fee ≈ ' + feeDisplay +
+          '. Dipotong otomatis dari saldo <strong>USDT</strong> Anda — tidak perlu memiliki CELO native.';
+        note.style.color = '#22c55e';
+      } else {
+        note.textContent = '⚠ Network fees dibayar dalam ' + networks[net].symbol +
+          '. Pastikan saldo ' + networks[net].symbol + ' cukup untuk gas.';
+      }
       box.appendChild(table);
       box.appendChild(note);
 
@@ -1404,7 +1676,8 @@ function setupSendModal() {
     statusPreview.classList.remove('hidden');
 
     try {
-      var tx = await sendUSDT(pendingTx.to, pendingTx.amountWei, wallet.encryptedPrivateKey, pendingTx.network, pendingTx.gasPrice);
+      // Teruskan feeCurrency jika ada (CELO CIP-64 — gas dipotong dari USDT)
+      var tx = await sendUSDT(pendingTx.to, pendingTx.amountWei, wallet.encryptedPrivateKey, pendingTx.network, pendingTx.gasPrice, pendingTx.feeCurrency || null);
       setStatus(statusPreview, 'success', '✓ Sent! TX: ' + tx.hash.slice(0, 18) + '…');
       showToast('USDT sent successfully!', 'success');
       setTimeout(function() {
