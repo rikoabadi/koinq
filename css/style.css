@@ -581,56 +581,114 @@ html, body {
 }
 .tx-section-header h3 { font-size: 14px; font-weight: 700; }
 
-.tx-list { padding: 0; }
-.tx-item {
-  padding: 14px 16px;
-  border-bottom: 1px solid var(--border);
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  transition: background 0.12s;
-}
-.tx-item:last-child { border-bottom: none; }
-.tx-item:hover { background: var(--bg3); }
+.tx-list { padding: 0; overflow-x: auto; }
 
-.tx-icon {
-  width: 36px;
-  height: 36px;
-  border-radius: 50%;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 16px;
-  flex-shrink: 0;
-}
+/* legacy .tx-item removed — now using .tx-row table layout */
+
 .tx-icon.in  { background: rgba(53,168,83,0.15); }
 .tx-icon.out { background: rgba(229,57,53,0.15); }
 
-.tx-info { flex: 1; min-width: 0; }
-.tx-info .tx-type { font-size: 13px; font-weight: 600; }
-.tx-info .tx-hash {
-  font-size: 11px;
+/* ===== Transactions Table ===== */
+.tx-table-header {
+  display: grid;
+  grid-template-columns: 1.4fr 1fr 1fr 0.7fr 1.1fr 0.4fr;
+  padding: 8px 14px;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
   color: var(--text2);
-  font-family: monospace;
-  white-space: nowrap;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg3);
+}
+
+.tx-row {
+  display: grid;
+  grid-template-columns: 1.4fr 1fr 1fr 0.7fr 1.1fr 0.4fr;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border);
+  align-items: center;
+  gap: 4px;
+  transition: background 0.12s;
+}
+.tx-row:last-child { border-bottom: none; }
+.tx-row:hover { background: var(--bg3); }
+.tx-row.tx-error { opacity: 0.6; }
+
+.tx-cell {
+  font-size: 12px;
   overflow: hidden;
   text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
 }
-.tx-right { text-align: right; flex-shrink: 0; }
-.tx-right .tx-amount { font-size: 13px; font-weight: 700; }
-.tx-right .tx-time { font-size: 11px; color: var(--text2); }
+
+.tx-hash-link {
+  color: var(--accent);
+  text-decoration: none;
+  font-family: monospace;
+  font-size: 11px;
+}
+.tx-hash-link:hover { text-decoration: underline; }
+
+.tx-cell-addr span {
+  display: inline-block;
+  font-size: 11px;
+  font-family: monospace;
+  padding: 2px 5px;
+  border-radius: 4px;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.tx-addr-self { background: rgba(240,185,11,0.12); color: var(--accent); }
+.tx-addr-ext  { background: var(--bg3); color: var(--text2); border: 1px solid var(--border); }
+
+.tx-cell-age  { color: var(--text2); font-size: 11px; }
+.tx-cell-amount { font-weight: 700; font-size: 12px; }
+.tx-failed    { color: var(--danger) !important; font-size: 11px; }
+
+.tx-detail-btn {
+  text-decoration: none;
+  font-size: 14px;
+  opacity: 0.6;
+  transition: opacity 0.15s;
+  display: inline-block;
+  text-align: center;
+}
+.tx-detail-btn:hover { opacity: 1; }
 
 .tx-empty {
   padding: 36px 16px;
   text-align: center;
   color: var(--text2);
   font-size: 13px;
+  line-height: 1.8;
 }
 
 .tx-loading {
   padding: 24px;
   display: flex;
+  align-items: center;
   justify-content: center;
+  gap: 10px;
+  color: var(--text2);
+  font-size: 13px;
+}
+
+/* Mobile: hide From/To columns, show only Hash, Age, Amount, Detail */
+@media (max-width: 639px) {
+  .tx-table-header,
+  .tx-row {
+    grid-template-columns: 1.4fr 0fr 0fr 0.7fr 1.2fr 0.4fr;
+  }
+  .tx-table-header span:nth-child(2),
+  .tx-table-header span:nth-child(3),
+  .tx-cell:nth-child(2),
+  .tx-cell:nth-child(3) {
+    display: none;
+  }
 }
 
 /* ===== Send Modal ===== */

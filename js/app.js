@@ -29,10 +29,6 @@ function bfSave(s) {
   try { localStorage.setItem(BF_STORAGE_KEY, JSON.stringify(s)); } catch (e) {}
 }
 
-function bfReset() {
-  try { localStorage.removeItem(BF_STORAGE_KEY); } catch (e) {}
-}
-
 // Cooldown eksponensial: 0, 0, 10s, 30s, 90s, 3m, 9m, 15m, 15m, 15m, lalu lockout 24 jam
 function getUnlockCooldownMs(attempts) {
   if (attempts <= 2) return 0;
@@ -124,21 +120,31 @@ var networks = {
   BSC: {
     name: 'BNB Smart Chain',
     rpcUrl: 'https://bsc-dataseed.binance.org/',
+    rpcFallbacks: [
+      'https://bsc-dataseed1.binance.org/',
+      'https://bsc-dataseed2.binance.org/',
+      'https://bsc-dataseed3.binance.org/'
+    ],
     chainId: 56,
     symbol: 'BNB',
     explorerApi: 'https://api.bscscan.com/api',
     explorerTx: 'https://bscscan.com/tx/',
+    explorerAddr: 'https://bscscan.com/address/',
     usdtAddress: '0x55d398326f99059fF775485246999027B3197955',
     usdtDecimals: 18
   },
   CELO: {
     name: 'Celo',
     rpcUrl: 'https://forno.celo.org',
+    rpcFallbacks: [
+      'https://rpc.ankr.com/celo'
+    ],
     chainId: 42220,
     symbol: 'CELO',
     explorerApi: 'https://api.celoscan.io/api',
     explorerTx: 'https://celoscan.io/tx/',
-    usdtAddress: '0x617f3112bf5397D0467D315cC709EF968D9ba546',
+    explorerAddr: 'https://celoscan.io/address/',
+    usdtAddress: '0x48065fbbe25f71c9282ddf5e1cd6d6a887483d5e',
     usdtDecimals: 6
   }
 };
@@ -147,6 +153,8 @@ var networks = {
 var ERC20_ABI = [
   'function balanceOf(address owner) view returns (uint256)',
   'function decimals() view returns (uint8)',
+  'function symbol() view returns (string)',
+  'function name() view returns (string)',
   'function transfer(address to, uint256 amount) returns (bool)'
 ];
 
@@ -191,86 +199,361 @@ function getHDWallet(mnemonic, index) {
   return { address: wallet.address, privateKey: wallet.privateKey };
 }
 
-// Fetch native balance for a single network
+// Fetch native balance — tries primary RPC then fallbacks
 async function fetchBalance(address, network) {
-  try {
-    var provider = new ethers.JsonRpcProvider(networks[network].rpcUrl);
-    var bal = await provider.getBalance(address);
-    return ethers.formatEther(bal);
-  } catch (e) {
-    return '–';
+  var cfg = networks[network];
+  var rpcs = [cfg.rpcUrl].concat(cfg.rpcFallbacks || []);
+  for (var i = 0; i < rpcs.length; i++) {
+    try {
+      var bal = await new ethers.JsonRpcProvider(rpcs[i]).getBalance(address);
+      return ethers.formatEther(bal);
+    } catch (e) { /* try next */ }
   }
+  return '–';
 }
 
-// Fetch USDT balance on the given network
+// Fetch USDT balance — tries primary RPC then fallbacks
 async function fetchUSDTBalance(address, network) {
-  try {
-    var cfg = networks[network];
-    var provider = new ethers.JsonRpcProvider(cfg.rpcUrl);
-    var contract = new ethers.Contract(cfg.usdtAddress, ERC20_ABI, provider);
-    var bal = await contract.balanceOf(address);
-    return ethers.formatUnits(bal, cfg.usdtDecimals);
-  } catch (e) {
-    return '–';
+  var cfg = networks[network];
+  var rpcs = [cfg.rpcUrl].concat(cfg.rpcFallbacks || []);
+  for (var i = 0; i < rpcs.length; i++) {
+    try {
+      var provider = new ethers.JsonRpcProvider(rpcs[i]);
+      var bal = await new ethers.Contract(cfg.usdtAddress, ERC20_ABI, provider).balanceOf(address);
+      return ethers.formatUnits(bal, cfg.usdtDecimals);
+    } catch (e) { /* try next */ }
   }
+  return '–';
 }
 
 // Simulate USDT transfer — returns gas estimate details without sending
 async function estimateUSDTTransfer(to, amount, fromAddress, network) {
   var cfg = networks[network];
-  var provider = new ethers.JsonRpcProvider(cfg.rpcUrl);
-  var contract = new ethers.Contract(cfg.usdtAddress, ERC20_ABI, provider);
-  var amountWei = ethers.parseUnits(amount, cfg.usdtDecimals);
+  var rpcs = [cfg.rpcUrl].concat(cfg.rpcFallbacks || []);
 
-  var [feeData, gasUnits] = await Promise.all([
-    provider.getFeeData(),
-    contract.transfer.estimateGas(to, amountWei, { from: fromAddress })
-  ]);
-
-  var gasPrice = feeData.gasPrice;
-  var gasFeeWei = gasUnits * gasPrice;
-
-  return {
-    to: to,
-    amount: amount,
-    amountWei: amountWei,
-    gasUnits: gasUnits.toString(),
-    gasPriceGwei: ethers.formatUnits(gasPrice, 'gwei'),
-    gasFeeNative: ethers.formatEther(gasFeeWei),
-    gasPrice: gasPrice,
-    network: network
-  };
-}
-
-// Send USDT via ERC-20 transfer
-async function sendUSDT(to, amountWei, encryptedPrivateKey, network, gasPrice) {
-  var privateKey = await decryptStr(encryptedPrivateKey);
-  var cfg = networks[network];
-  var provider = new ethers.JsonRpcProvider(cfg.rpcUrl);
-  var wallet = new ethers.Wallet(privateKey, provider);
-  privateKey = null; // Clear local reference once Wallet object is created
-  var contract = new ethers.Contract(cfg.usdtAddress, ERC20_ABI, wallet);
-  var tx = await contract.transfer(to, amountWei, { gasPrice: gasPrice });
-  return tx;
-}
-
-// Fetch last 10 transactions from explorer API
-async function fetchTransactions(address, network) {
+  // Prepare amount in token decimals
+  var amountWei;
   try {
-    var api = networks[network].explorerApi;
-    var url = api + '?module=account&action=txlist&address=' + encodeURIComponent(address) +
-              '&startblock=0&endblock=99999999&page=1&offset=10&sort=desc';
-    var res = await fetch(url, { mode: 'cors', credentials: 'omit' });
-    var data = await res.json();
-    if (data.status === '1' && Array.isArray(data.result)) return data.result;
-    return [];
+    amountWei = ethers.parseUnits(amount.toString(), cfg.usdtDecimals);
   } catch (e) {
+    throw new Error('Invalid amount');
+  }
+
+  for (var i = 0; i < rpcs.length; i++) {
+    try {
+      var provider = new ethers.JsonRpcProvider(rpcs[i]);
+      // Create contract and populate transfer tx data (ethers v6 API)
+      var ctr = new ethers.Contract(cfg.usdtAddress, ERC20_ABI, provider);
+      var populated = await ctr.transfer.populateTransaction(to, amountWei);
+
+      // Estimate gas (include `from` so nodes can estimate correctly)
+      var gasEstimate = await provider.estimateGas({ to: cfg.usdtAddress, data: populated.data, from: fromAddress });
+      // ethers v6: use getFeeData() instead of deprecated getGasPrice()
+      var feeData = await provider.getFeeData();
+      var gasPrice = feeData.gasPrice || feeData.maxFeePerGas || BigInt(0);
+
+      var gasUnits = gasEstimate.toString();
+      var gasPriceGwei = Number(ethers.formatUnits(gasPrice, 9));
+      // ethers v6: gasEstimate and gasPrice are BigInt — use * operator
+      var feeNative = ethers.formatUnits(gasEstimate * gasPrice, 18);
+
+      return {
+        to: to,
+        amountWei: amountWei.toString(),
+        network: network,
+        gasUnits: gasUnits,
+        gasPrice: gasPrice.toString(),
+        gasPriceGwei: gasPriceGwei,
+        gasFeeNative: Number(feeNative)
+      };
+    } catch (e) {
+      console.warn('[KoinQ] estimateUSDTTransfer failed for RPC', rpcs[i], e && e.message);
+      // try next RPC
+    }
+  }
+  throw new Error('Gas estimation failed');
+}
+
+// Normalize explorer-style tx objects (generic txlist / Blockscout results)
+function normaliseTx(tx) {
+  var out = {
+    hash: tx.hash || tx.transactionHash || tx.txHash || tx.transaction_hash || tx.tx_hash || '',
+    from: tx.from || tx.sender || tx.from_address || tx.owner || '',
+    to: tx.to || tx.to_address || tx.recipient || '',
+    value: tx.value || tx.amount || tx.contractValue || '0',
+    timeStamp: parseTimestamp(tx.timeStamp || tx.timestamp || tx.time || tx.blockTimestamp || tx.blockTime),
+    isError: tx.isError || tx.txreceipt_status || tx.status || '0'
+  };
+
+  if (tx.tokenDecimal !== undefined && tx.tokenDecimal !== null) out.tokenDecimal = Number(tx.tokenDecimal);
+  if (tx.tokenSymbol) out.tokenSymbol = tx.tokenSymbol;
+  if (tx.contractAddress) out.contract = tx.contractAddress;
+  // leave tokenDecimal undefined when unknown
+
+  return out;
+}
+
+// Normalize MetaMask Accounts API / modern explorer objects (best-effort)
+function normaliseExplorerTx(tx) {
+  if (!tx) return { hash: '', from: '', to: '', value: '0', timeStamp: String(Math.floor(Date.now() / 1000)) };
+  var out = {};
+  out.hash = tx.hash || tx.txHash || tx.transactionHash || (tx.raw && tx.raw.hash) || '';
+  out.from = tx.from || tx.txFrom || (tx.raw && tx.raw.from) || '';
+  out.to = tx.to || tx.txTo || (tx.raw && tx.raw.to) || '';
+  out.isError = tx.isError || tx.status || '0';
+
+  // Try token transfer shapes
+  if (Array.isArray(tx.valueTransfers) && tx.valueTransfers.length > 0) {
+    var vt = tx.valueTransfers[0];
+    out.value = vt.value || vt.amount || '0';
+    out.tokenSymbol = vt.symbol || vt.tokenSymbol || null;
+    out.tokenDecimal = vt.tokenDecimal !== undefined && vt.tokenDecimal !== null ? Number(vt.tokenDecimal) : null;
+    out.timeStamp = parseTimestamp(vt.time || vt.timeStamp || tx.timeStamp || tx.timestamp);
+    out.contract = vt.contract || vt.contractAddress || null;
+    return out;
+  }
+
+  // Otherwise fall back to simpler fields
+  out.value = tx.value || '0';
+  out.timeStamp = parseTimestamp(tx.timeStamp || tx.timestamp || tx.receivedAt);
+  return out;
+}
+
+// Parse a variety of timestamp formats into unix seconds string
+function parseTimestamp(ts) {
+  if (!ts) return String(Math.floor(Date.now() / 1000));
+  // numeric or numeric string
+  var n = Number(ts);
+  if (!isNaN(n)) {
+    // If timestamp looks like milliseconds (>= 1e12), convert to seconds
+    if (n > 1e12) return String(Math.floor(n / 1000));
+    // If it's already seconds (reasonable range), return as integer string
+    if (n > 1e9) return String(Math.floor(n));
+    // small numbers -> fallback to now
+    return String(Math.floor(Date.now() / 1000));
+  }
+  // Try ISO date parse
+  var parsed = Date.parse(ts);
+  if (!isNaN(parsed)) return String(Math.floor(parsed / 1000));
+  return String(Math.floor(Date.now() / 1000));
+}
+
+// Send USDT: decrypt private key, attach provider for network, and send transfer
+async function sendUSDT(to, amountWei, encryptedPrivateKey, network, gasPrice) {
+  var cfg = networks[network];
+  if (!cfg) throw new Error('Unknown network');
+
+  // Ensure session key exists to decrypt the stored private key
+  if (!sessionEncKey) throw new Error('Session key not initialized');
+
+  // Decrypt private key (stored during wallet creation)
+  var pk = (await decryptStr(encryptedPrivateKey)).trim();
+  if (!pk.startsWith('0x')) pk = '0x' + pk;
+
+  // Prepare provider and signer
+  var provider = new ethers.JsonRpcProvider(cfg.rpcUrl);
+  var wallet = new ethers.Wallet(pk, provider);
+
+  // Connect contract with signer and send transfer
+  var contract = new ethers.Contract(cfg.usdtAddress, ERC20_ABI, wallet);
+
+  var overrides = {};
+  try {
+    if (gasPrice) {
+      // ethers v6: gasPrice must be BigInt; convert from string if needed
+      overrides.gasPrice = BigInt(gasPrice);
+    }
+    // ethers v6: amountWei must be BigInt; convert if stored as string
+    var amountWeiBig = BigInt(amountWei);
+    var txResp = await contract.transfer(to, amountWeiBig, overrides);
+    // Return the transaction response (caller may wait for confirmation)
+    return txResp;
+  } catch (e) {
+    console.warn('[KoinQ] sendUSDT failed', e && e.message);
+    throw e;
+  }
+}
+
+// Fallback: use RPC getLogs to find ERC-20 Transfer events for an address (no API key required)
+async function fetchTransactionsByLogs(address, network) {
+  var cfg = networks[network];
+  var rpcs = [cfg.rpcUrl].concat(cfg.rpcFallbacks || []);
+  var transferTopic = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
+  var results = [];
+
+  for (var i = 0; i < rpcs.length; i++) {
+    try {
+      var provider = new ethers.JsonRpcProvider(rpcs[i]);
+      var latest = await provider.getBlockNumber();
+      var fromBlock = Math.max(0, latest - 50000); // search last ~50k blocks (configurable)
+
+      // Prepare padded topic for address matching (topics[1]=from, topics[2]=to)
+      var addrNo0x = address.toLowerCase().replace(/^0x/, '');
+      var addrTopic = '0x' + addrNo0x.padStart(64, '0');
+
+      // Do NOT hardcode a token contract. Fetch logs across all contracts by omitting `address`.
+      var toFilter = {
+        fromBlock: fromBlock,
+        toBlock: latest,
+        topics: [transferTopic, null, addrTopic]
+      };
+      var fromFilter = {
+        fromBlock: fromBlock,
+        toBlock: latest,
+        topics: [transferTopic, addrTopic]
+      };
+
+      var toLogs = await provider.getLogs(toFilter);
+      var fromLogs = await provider.getLogs(fromFilter);
+
+      var all = toLogs.concat(fromLogs);
+
+      // Collect unique contract addresses to query decimals/symbol later
+      var contracts = {};
+      all.forEach(function(lg) { contracts[lg.address.toLowerCase()] = true; });
+      var contractMeta = {};
+      var contractAddrs = Object.keys(contracts);
+      for (var k = 0; k < contractAddrs.length; k++) {
+        var caddr = contractAddrs[k];
+        try {
+          var ctr = new ethers.Contract(caddr, ERC20_ABI, provider);
+          var dec = await ctr.decimals();
+          var sym = await ctr.symbol();
+          contractMeta[caddr] = { decimals: dec !== undefined ? Number(dec) : null, symbol: sym || null };
+        } catch (e) {
+          contractMeta[caddr] = { decimals: null, symbol: null };
+        }
+      }
+
+      // Deduplicate by txHash+logIndex and build results
+      var seen = {};
+      for (var j = 0; j < all.length; j++) {
+        var lg = all[j];
+        var key = lg.transactionHash + '_' + lg.logIndex;
+        if (seen[key]) continue;
+        seen[key] = true;
+
+        // Parse topics: topics[1]=from, topics[2]=to
+        var fromAddr = '0x' + (lg.topics[1] || '').slice(-40);
+        var toAddr = '0x' + (lg.topics[2] || '').slice(-40);
+        var value = lg.data || '0x0';
+
+        // Fetch block timestamp
+        var blk = await provider.getBlock(lg.blockNumber);
+        var ts = blk && blk.timestamp ? String(blk.timestamp) : String(Date.now() / 1000 | 0);
+
+        var caddrLower = lg.address.toLowerCase();
+        var meta = contractMeta[caddrLower] || { decimals: null, symbol: null };
+
+        results.push({
+          hash: lg.transactionHash,
+          from: fromAddr,
+          to: toAddr,
+          value: value,
+          timeStamp: ts,
+          contractAddress: lg.address,
+          tokenDecimal: meta.decimals,
+          tokenSymbol: meta.symbol
+        });
+      }
+
+      // Sort by block desc
+      results.sort(function(a,b){ return (b.timeStamp || 0) - (a.timeStamp || 0); });
+      return results.map(normaliseTx);
+    } catch (e) {
+      console.warn('[KoinQ] getLogs fallback failed for RPC', rpcs[i], e && e.message);
+      // try next RPC
+    }
+  }
+  return [];
+}
+// Fetch last 20 transactions from explorer API (with CELO Blockscout token endpoint)
+async function fetchTransactions(address, network) {
+  var cfg = networks[network];
+
+  // For BSC prefer MetaMask Accounts API (no API key) which returns rich tx objects
+  if (network === 'BSC') {
+    try {
+      var mmUrl = 'https://accounts.api.cx.metamask.io/v1/accounts/' + encodeURIComponent(address) +
+                  '/transactions?networks=0x1,0x89,0x38,0xe708,0x2105,0xa,0xa4b1,0x82750,0x531,0x8f&sortDirection=DESC';
+      console.debug('[KoinQ] Querying MetaMask Accounts API:', mmUrl);
+      var mmRes = await fetch(mmUrl, { mode: 'cors', credentials: 'omit' });
+      if (mmRes.ok) {
+        var mmData = await mmRes.json();
+        if (mmData && Array.isArray(mmData.data) && mmData.data.length > 0) {
+          console.debug('[KoinQ] MetaMask accounts API returned', mmData.data.length, 'txs');
+          return mmData.data.map(normaliseExplorerTx);
+        }
+      }
+    } catch (e) {
+      console.warn('[KoinQ] MetaMask accounts API failed:', e && e.message);
+      // fallthrough to other explorer attempts
+    }
+  }
+
+  // Special handling for CELO: prefer Blockscout token transfers endpoint (tokentx)
+  if (network === 'CELO') {
+    try {
+      // Try Blockscout tokentx without `contractaddress` to list token transfers for the address
+      var blockscoutUrl = 'https://celo.blockscout.com/api?module=account&action=tokentx' +
+                          '&address=' + encodeURIComponent(address) +
+                          '&page=1&offset=20&sort=desc';
+      console.debug('[KoinQ] Attempting Blockscout tokentx:', blockscoutUrl);
+      var res = await fetch(blockscoutUrl, { mode: 'cors', credentials: 'omit' });
+      if (res.ok) {
+        var data = await res.json();
+        console.debug('[KoinQ] Blockscout response:', data && data.result && data.result.length);
+        if (Array.isArray(data.result) && data.result.length > 0) {
+          return data.result.map(normaliseTx);
+        }
+      }
+    } catch (e) {
+      console.warn('Blockscout tokentx failed for CELO:', e && e.message);
+    }
+  }
+
+  // Generic explorer API attempt (BSC / CELO general txlist)
+  var api = cfg.explorerApi;
+  var url = api + '?module=account&action=txlist&address=' + encodeURIComponent(address) +
+            '&startblock=0&endblock=99999999&page=1&offset=20&sort=desc';
+  try {
+    var res2 = await fetch(url, { mode: 'cors', credentials: 'omit' });
+    if (!res2.ok) throw new Error('HTTP ' + res2.status);
+    var data2 = await res2.json();
+    // If explorer returns the newer structured format (data array), normalize that
+    if (Array.isArray(data2.data) && data2.data.length > 0) {
+      return data2.data.map(normaliseExplorerTx);
+    }
+    if (data2.status === '1' && Array.isArray(data2.result) && data2.result.length > 0) {
+      return data2.result.map(normaliseTx);
+    }
+    if (Array.isArray(data2.result) && data2.result.length === 0) return [];
+    if (Array.isArray(data2.data) && data2.data.length === 0) return [];
+    if (data2.message === 'No transactions found') return [];
+    throw new Error(data2.message || 'empty');
+  } catch (e) {
+    console.warn('Explorer API failed for ' + network + ':', e && e.message);
+    // If BSC explorer deprecated (NOTOK) or failed, try RPC getLogs fallback (no API key)
+    if (network === 'BSC') {
+      try {
+        return await fetchTransactionsByLogs(address, network);
+      } catch (err) {
+        console.warn('[KoinQ] getLogs fallback also failed:', err && err.message);
+      }
+    }
     return [];
   }
 }
 
 /* ===== DOM Helpers ===== */
 function $(id) { return document.getElementById(id); }
+
+// Create a spinner <span> element
+function makeSpinner() {
+  var sp = document.createElement('span');
+  sp.className = 'spinner';
+  return sp;
+}
 
 function showToast(msg, type) {
   var container = $('toast-container');
@@ -290,6 +573,7 @@ function copyText(text) {
 }
 
 function shortenAddress(addr) {
+  if (!addr || addr.length < 10) return addr || '–';
   return addr.slice(0, 6) + '…' + addr.slice(-4);
 }
 
@@ -305,6 +589,18 @@ function timeAgo(ts) {
   if (diff < 3600) return Math.floor(diff / 60) + 'm ago';
   if (diff < 86400) return Math.floor(diff / 3600) + 'h ago';
   return Math.floor(diff / 86400) + 'd ago';
+}
+
+// Try each RPC in order, return first working JsonRpcProvider
+async function makeProvider(rpcs) {
+  for (var i = 0; i < rpcs.length; i++) {
+    try {
+      var p = new ethers.JsonRpcProvider(rpcs[i]);
+      await p.getBlockNumber(); // quick connectivity check
+      return p;
+    } catch (e) { /* try next */ }
+  }
+  throw new Error('All RPC endpoints failed');
 }
 
 /* ===== Screen Management ===== */
@@ -352,12 +648,23 @@ function setupLogin() {
       tabUpload.classList.remove('active');
       panelManual.style.display = 'block';
       panelUpload.style.display = 'none';
+      // Ensure manual input is focusable when tab is opened
+      try { manualInput.disabled = false; manualInput.focus(); } catch (e) {}
     }
     errEl.classList.add('hidden');
   }
 
   tabUpload.addEventListener('click', function() { switchTab('upload'); });
   tabManual.addEventListener('click', function() { switchTab('manual'); });
+
+  // Make clicking the manual panel focus the input (helps if UI overlays overlap)
+  try {
+    panelManual.addEventListener('click', function(e) {
+      if (e.target === panelManual || e.target.classList.contains('input')) {
+        try { manualInput.focus(); } catch (err) {}
+      }
+    });
+  } catch (e) {}
 
   // --- File selection handler ---
   function handleFile(file) {
@@ -520,9 +827,7 @@ function setupLogin() {
     errEl.classList.add('hidden');
     unlockBtn.disabled = true;
     unlockBtn.textContent = '';
-    var sp = document.createElement('span');
-    sp.className = 'spinner';
-    unlockBtn.appendChild(sp);
+    unlockBtn.appendChild(makeSpinner());
     unlockBtn.appendChild(document.createTextNode(' Computing wallet…'));
 
     // Hitung attempt dan set cooldown SEBELUM proses — persist ke localStorage
@@ -599,6 +904,7 @@ function renderDashboard() {
 function renderSidebar() {
   var list = $('wallet-list');
   list.innerHTML = '';
+
   state.wallets.forEach(function(w, i) {
     var item = document.createElement('div');
     item.className = 'wallet-item' + (i === state.currentIndex ? ' active' : '');
@@ -727,79 +1033,131 @@ function renderTransactions() {
   var net  = state.network;
 
   if (state.txLoading) {
-    list.textContent = '';
+    list.innerHTML = '';
     var loadingDiv = document.createElement('div');
     loadingDiv.className = 'tx-loading';
     var spinnerEl = document.createElement('span');
     spinnerEl.className = 'spinner';
     loadingDiv.appendChild(spinnerEl);
+    loadingDiv.appendChild(document.createTextNode(' Loading transactions…'));
     list.appendChild(loadingDiv);
     return;
   }
 
+  if (!state.transactions) {
+    list.innerHTML = '';
+    var errDiv = document.createElement('div');
+    errDiv.className = 'tx-empty';
+    errDiv.innerHTML = '⚠️ Explorer API unavailable.<br/><small>Check your connection or try again later.</small>';
+    list.appendChild(errDiv);
+    return;
+  }
+
   if (!state.transactions || state.transactions.length === 0) {
-    list.textContent = '';
+    list.innerHTML = '';
     var emptyDiv = document.createElement('div');
     emptyDiv.className = 'tx-empty';
-    emptyDiv.textContent = 'No transactions found';
+    emptyDiv.textContent = 'No transactions found for this address.';
     list.appendChild(emptyDiv);
     return;
   }
 
-  list.textContent = '';
+  list.innerHTML = '';
+
+  // Table header
+  var header = document.createElement('div');
+  header.className = 'tx-table-header';
+  header.innerHTML =
+    '<span>Tx Hash</span>' +
+    '<span>From</span>' +
+    '<span>To</span>' +
+    '<span>Age</span>' +
+    '<span>Amount</span>' +
+    '<span>Detail</span>';
+  list.appendChild(header);
+
   state.transactions.forEach(function(tx) {
     var isIn = tx.to && tx.to.toLowerCase() === addr.toLowerCase();
-    var direction = isIn ? 'in' : 'out';
-    var dirIcon   = isIn ? '↓' : '↑';
-    var dirLabel  = isIn ? 'Received' : 'Sent';
-    var amountEth = ethers.formatEther(tx.value || '0');
-    var amountFmt = formatAmount(amountEth);
-    var sym       = networks[net].symbol;
-    var explorerUrl = networks[net].explorerTx + encodeURIComponent(tx.hash);
+    // Determine display amount and symbol: prefer token info (e.g., USDT) when present
+    var displayAmountRaw = '0';
+    var displaySym = networks[net].symbol;
+    if (tx.tokenSymbol) {
+      // token transfer: use provided decimals, fallback to network USDT decimals
+      var dec = (tx.tokenDecimal != null) ? tx.tokenDecimal : (networks[net].usdtDecimals || 18);
+      try { displayAmountRaw = ethers.formatUnits(tx.value || '0', dec); }
+      catch (e) { displayAmountRaw = (Number(tx.value || 0) / Math.pow(10, dec)).toString(); }
+      displaySym = tx.tokenSymbol;
+    } else {
+      // native transfer (wei)
+      try { displayAmountRaw = ethers.formatEther(tx.value || '0'); }
+      catch (e) { displayAmountRaw = '0'; }
+    }
+    var amountFmt = formatAmount(displayAmountRaw);
+    var explorerUrl = networks[net].explorerTx + tx.hash;
 
-    var item = document.createElement('div');
-    item.className = 'tx-item';
+    var row = document.createElement('div');
+    row.className = 'tx-row' + (tx.isError === '1' ? ' tx-error' : '');
 
-    var iconEl = document.createElement('div');
-    iconEl.className = 'tx-icon ' + direction;
-    iconEl.textContent = dirIcon;
+    // Tx Hash
+    var cellHash = document.createElement('div');
+    cellHash.className = 'tx-cell tx-cell-hash';
+    var hashLink = document.createElement('a');
+    hashLink.href = explorerUrl;
+    hashLink.target = '_blank';
+    hashLink.rel = 'noopener noreferrer';
+    hashLink.className = 'tx-hash-link';
+    hashLink.textContent = tx.hash.slice(0, 8) + '…' + tx.hash.slice(-6);
+    hashLink.title = tx.hash;
+    cellHash.appendChild(hashLink);
 
-    var infoEl = document.createElement('div');
-    infoEl.className = 'tx-info';
+    // From
+    var cellFrom = document.createElement('div');
+    cellFrom.className = 'tx-cell tx-cell-addr';
+    var fromEl = document.createElement('span');
+    fromEl.className = isIn ? 'tx-addr-ext' : 'tx-addr-self';
+    fromEl.textContent = shortenAddress(tx.from || '0x???');
+    fromEl.title = tx.from;
+    cellFrom.appendChild(fromEl);
 
-    var typeEl = document.createElement('div');
-    typeEl.className = 'tx-type';
-    typeEl.textContent = dirLabel;
+    // To
+    var cellTo = document.createElement('div');
+    cellTo.className = 'tx-cell tx-cell-addr';
+    var toEl = document.createElement('span');
+    toEl.className = isIn ? 'tx-addr-self' : 'tx-addr-ext';
+    toEl.textContent = shortenAddress(tx.to || '0x???');
+    toEl.title = tx.to;
+    cellTo.appendChild(toEl);
 
-    var hashEl = document.createElement('a');
-    hashEl.className = 'tx-hash';
-    hashEl.href = explorerUrl;
-    hashEl.target = '_blank';
-    hashEl.rel = 'noopener noreferrer';
-    hashEl.textContent = tx.hash.slice(0, 20) + '…';
+    // Age
+    var cellAge = document.createElement('div');
+    cellAge.className = 'tx-cell tx-cell-age';
+    cellAge.textContent = timeAgo(tx.timeStamp);
 
-    infoEl.appendChild(typeEl);
-    infoEl.appendChild(hashEl);
+    // Amount
+    var cellAmt = document.createElement('div');
+    cellAmt.className = 'tx-cell tx-cell-amount ' + (isIn ? 'text-green' : 'text-danger');
+    cellAmt.textContent = (isIn ? '+' : '-') + amountFmt + ' ' + displaySym;
+    if (tx.isError === '1') { cellAmt.textContent = 'Failed'; cellAmt.className = 'tx-cell tx-cell-amount tx-failed'; }
 
-    var rightEl = document.createElement('div');
-    rightEl.className = 'tx-right';
+    // Detail link
+    var cellDetail = document.createElement('div');
+    cellDetail.className = 'tx-cell tx-cell-detail';
+    var detailLink = document.createElement('a');
+    detailLink.href = explorerUrl;
+    detailLink.target = '_blank';
+    detailLink.rel = 'noopener noreferrer';
+    detailLink.className = 'tx-detail-btn';
+    detailLink.textContent = '🔗';
+    detailLink.title = 'View on explorer';
+    cellDetail.appendChild(detailLink);
 
-    var amountEl = document.createElement('div');
-    amountEl.className = 'tx-amount ' + (isIn ? 'text-green' : 'text-danger');
-    amountEl.textContent = (isIn ? '+' : '-') + amountFmt + ' ' + sym;
-
-    var timeEl = document.createElement('div');
-    timeEl.className = 'tx-time';
-    timeEl.textContent = timeAgo(tx.timeStamp);
-
-    rightEl.appendChild(amountEl);
-    rightEl.appendChild(timeEl);
-
-    item.appendChild(iconEl);
-    item.appendChild(infoEl);
-    item.appendChild(rightEl);
-
-    list.appendChild(item);
+    row.appendChild(cellHash);
+    row.appendChild(cellFrom);
+    row.appendChild(cellTo);
+    row.appendChild(cellAge);
+    row.appendChild(cellAmt);
+    row.appendChild(cellDetail);
+    list.appendChild(row);
   });
 }
 
@@ -839,6 +1197,10 @@ async function loadTransactions(address) {
   renderTransactions();
 
   var txs = await fetchTransactions(address, state.network);
+  // null = API error, [] = no txs found, array = results
+  if (Array.isArray(txs)) {
+    txs.sort(function(a, b) { return (Number(b.timeStamp) || 0) - (Number(a.timeStamp) || 0); });
+  }
   state.transactions = txs;
   state.txLoading = false;
 
@@ -872,6 +1234,13 @@ function setupNetworkSwitcher() {
             state.balanceUSDT[usdtKey] = bal;
             state.balLoading = false;
             if (state.currentAddress === addr) renderBalanceGrid(addr);
+          });
+        }
+        // Re-fetch CELO native balance if missing or previously failed
+        if (net === 'CELO' && isNaN(parseFloat(state.balanceCELO[addr]))) {
+          fetchBalance(addr, 'CELO').then(function(bal) {
+            state.balanceCELO[addr] = bal;
+            if (state.currentAddress === addr && state.network === 'CELO') renderBalanceGrid(addr);
           });
         }
         loadTransactions(addr);
@@ -969,9 +1338,7 @@ function setupSendModal() {
     dryRunBtn.disabled = true;
     statusEl.className = 'modal-info info';
     statusEl.textContent = '';
-    var spDry = document.createElement('span');
-    spDry.className = 'spinner';
-    statusEl.appendChild(spDry);
+    statusEl.appendChild(makeSpinner());
     statusEl.appendChild(document.createTextNode(' Simulating transfer…'));
     statusEl.classList.remove('hidden');
 
@@ -1032,9 +1399,7 @@ function setupSendModal() {
     confirmBtn.disabled = true;
     statusPreview.className = 'modal-info info';
     statusPreview.textContent = '';
-    var spSend = document.createElement('span');
-    spSend.className = 'spinner';
-    statusPreview.appendChild(spSend);
+    statusPreview.appendChild(makeSpinner());
     statusPreview.appendChild(document.createTextNode(' Sending USDT…'));
     statusPreview.classList.remove('hidden');
 
@@ -1074,34 +1439,34 @@ function setupBackBtn() {
 /* ===== Logout ===== */
 function setupLogout() {
   $('logout-btn').addEventListener('click', function() {
+    // Clear sensitive state
     state.encryptedMnemonic = null;
-    state.wallets  = [];
-    state.currentAddress = '';
-    state.transactions = [];
-    state.balanceBSC  = {};
-    state.balanceCELO = {};
-    state.balanceUSDT = {};
-    sessionEncKey = null;
+    state.wallets           = [];
+    state.currentAddress    = '';
+    state.transactions      = [];
+    state.balanceBSC        = {};
+    state.balanceCELO       = {};
+    state.balanceUSDT       = {};
+    sessionEncKey           = null;
+
+    // Reset login UI
     $('password-input').value = '';
     $('login-error').classList.add('hidden');
-    // Reset file selection UI
-    var fileInput = $('key-file-input');
-    if (fileInput) fileInput.value = '';
-    var selInfo = $('file-selected-info');
-    var dropContent = $('file-drop-content');
-    if (selInfo) selInfo.style.display = 'none';
-    if (dropContent) dropContent.style.display = 'flex';
-    var copyHBtn = $('copy-hash-btn');
-    if (copyHBtn) copyHBtn.classList.add('hidden');
-    var manualInp = $('manual-hash-input');
-    if (manualInp) manualInp.value = '';
-    var manualHnt = $('manual-hash-hint');
-    if (manualHnt) { manualHnt.textContent = ''; manualHnt.className = 'hash-hint-msg'; }
-    // Reset ke tab upload
-    var tabUp = $('tab-upload'); var tabMn = $('tab-manual');
-    var panUp = $('panel-upload'); var panMn = $('panel-manual');
-    if (tabUp && tabMn) { tabUp.classList.add('active'); tabMn.classList.remove('active'); }
-    if (panUp && panMn) { panUp.style.display = 'block'; panMn.style.display = 'none'; }
+    $('key-file-input').value = '';
+    $('file-selected-info').style.display = 'none';
+    $('file-drop-content').style.display  = 'flex';
+    $('copy-hash-btn').classList.add('hidden');
+    $('manual-hash-input').value = '';
+    var hint = $('manual-hash-hint');
+    hint.textContent = '';
+    hint.className   = 'hash-hint-msg';
+
+    // Reset to upload tab
+    $('tab-upload').classList.add('active');
+    $('tab-manual').classList.remove('active');
+    $('panel-upload').style.display = 'block';
+    $('panel-manual').style.display = 'none';
+
     showScreen('login-screen');
   });
 }
@@ -1197,9 +1562,7 @@ function setupPhraseModal() {
 
     confirmBtn.disabled = true;
     confirmBtn.textContent = '';
-    var sp = document.createElement('span');
-    sp.className = 'spinner';
-    confirmBtn.appendChild(sp);
+    confirmBtn.appendChild(makeSpinner());
     confirmBtn.appendChild(document.createTextNode(' Verifying…'));
 
     try {
