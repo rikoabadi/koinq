@@ -291,17 +291,38 @@ async function fetchTransactions(address, network) {
     var res = await fetch(url, { mode: 'cors', credentials: 'omit' });
     if (!res.ok) throw new Error('HTTP ' + res.status);
     var data = await res.json();
-    if (data.status === '1' && Array.isArray(data.result) && data.result.length > 0) {
+    if (data.status === '1' && Array.isArray(data.result)) {
       return data.result.map(normaliseTx);
     }
-    // status '0' with message NOTOK means no tx, not an error
+    // Empty result array regardless of status
+    if (Array.isArray(data.result) && data.result.length === 0) return [];
     if (data.message === 'No transactions found') return [];
     throw new Error(data.message || 'empty');
   } catch (e) {
-    // Fallback: read last 20 blocks of tx via RPC eth_getTransactionCount
-    // (block explorer CORS failed — return empty with note)
     console.warn('Explorer API failed for ' + network + ':', e.message);
+    // For CELO, try Celo Explorer (Blockscout) as fallback
+    if (network === 'CELO') {
+      return await fetchTransactionsCeloFallback(address);
+    }
     return null; // null = API failed (distinguished from empty [])
+  }
+}
+
+// Fallback: fetch CELO transactions from Celo Explorer (Blockscout)
+async function fetchTransactionsCeloFallback(address) {
+  var url = 'https://explorer.celo.org/api?module=account&action=txlist&address=' +
+            encodeURIComponent(address) + '&startblock=0&endblock=99999999&page=1&offset=20&sort=desc';
+  try {
+    var res = await fetch(url, { mode: 'cors', credentials: 'omit' });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    var data = await res.json();
+    if (data.status === '1' && Array.isArray(data.result)) return data.result.map(normaliseTx);
+    if (Array.isArray(data.result) && data.result.length === 0) return [];
+    if (data.message === 'No transactions found') return [];
+    return null;
+  } catch (e) {
+    console.warn('Celo Explorer fallback API failed:', e.message);
+    return null;
   }
 }
 
@@ -949,6 +970,13 @@ function setupNetworkSwitcher() {
             state.balanceUSDT[usdtKey] = bal;
             state.balLoading = false;
             if (state.currentAddress === addr) renderBalanceGrid(addr);
+          });
+        }
+        // Re-fetch CELO native balance if missing or previously failed
+        if (net === 'CELO' && isNaN(parseFloat(state.balanceCELO[addr]))) {
+          fetchBalance(addr, 'CELO').then(function(bal) {
+            state.balanceCELO[addr] = bal;
+            if (state.currentAddress === addr && state.network === 'CELO') renderBalanceGrid(addr);
           });
         }
         loadTransactions(addr);
