@@ -321,19 +321,24 @@ async function estimateUSDTTransfer(to, amount, fromAddress, network) {
 
 // Normalize explorer-style tx objects (generic txlist / Blockscout results)
 function normaliseTx(tx) {
+  // isError: hanya '1' jika isError === '1' ATAU txreceipt_status === '0' (failed)
+  // Jangan pakai tx.status langsung — di Blockscout status='1' artinya SUCCESS
+  var isErr = '0';
+  if (tx.isError === '1') isErr = '1';
+  else if (tx.txreceipt_status === '0') isErr = '1';
+
   var out = {
     hash: tx.hash || tx.transactionHash || tx.txHash || tx.transaction_hash || tx.tx_hash || '',
     from: tx.from || tx.sender || tx.from_address || tx.owner || '',
     to: tx.to || tx.to_address || tx.recipient || '',
     value: tx.value || tx.amount || tx.contractValue || '0',
     timeStamp: parseTimestamp(tx.timeStamp || tx.timestamp || tx.time || tx.blockTimestamp || tx.blockTime),
-    isError: tx.isError || tx.txreceipt_status || tx.status || '0'
+    isError: isErr
   };
 
   if (tx.tokenDecimal !== undefined && tx.tokenDecimal !== null) out.tokenDecimal = Number(tx.tokenDecimal);
   if (tx.tokenSymbol) out.tokenSymbol = tx.tokenSymbol;
   if (tx.contractAddress) out.contract = tx.contractAddress;
-  // leave tokenDecimal undefined when unknown
 
   return out;
 }
@@ -345,7 +350,10 @@ function normaliseExplorerTx(tx) {
   out.hash = tx.hash || tx.txHash || tx.transactionHash || (tx.raw && tx.raw.hash) || '';
   out.from = tx.from || tx.txFrom || (tx.raw && tx.raw.from) || '';
   out.to = tx.to || tx.txTo || (tx.raw && tx.raw.to) || '';
-  out.isError = tx.isError || tx.status || '0';
+  // MetaMask Accounts API: status is a string like 'confirmed', 'failed', 'submitted'
+  // tx.isError from Etherscan-style: '1' = error
+  var mmFailed = (typeof tx.status === 'string' && tx.status.toLowerCase() === 'failed');
+  out.isError = (tx.isError === '1' || mmFailed) ? '1' : '0';
 
   // Try token transfer shapes
   if (Array.isArray(tx.valueTransfers) && tx.valueTransfers.length > 0) {
@@ -383,8 +391,8 @@ function parseTimestamp(ts) {
   return String(Math.floor(Date.now() / 1000));
 }
 
-// Encode satu nilai RLP: bytes atau integer sebagai BigInt/number
-// Encode satu nilai RLP bytes (bukan integer 0 = kosong, tapi address/data/sig bytes)
+// Encode bytes sebagai RLP item (address, calldata, sig bytes)
+// BUKAN untuk integer — integer 0 di-encode sebagai 0x80 (kosong), bukan 0x00
 function rlpEncodeBytes(value) {
   var bytes;
   if (value === '0x' || value === '' || value === null || value === undefined) {
@@ -489,7 +497,7 @@ async function ecSign(digestHex, privateKeyHex) {
 // Send USDT: decrypt private key, attach provider for network, and send transfer
 // Untuk CELO CIP-64: encode RLP manual (type 0x7b=123) karena ethers v6 tidak support feeCurrency
 // Ref: https://docs.celo.org/developer/fee-currency  (ethers.js not supported natively)
-async function sendUSDT(to, amountWei, encryptedPrivateKey, network, gasPrice, feeCurrency) {
+async function sendUSDT(to, amountWei, encryptedPrivateKey, network, feeCurrency) {
   var cfg = networks[network];
   if (!cfg) throw new Error('Unknown network');
   if (!sessionEncKey) throw new Error('Session key not initialized');
@@ -497,149 +505,121 @@ async function sendUSDT(to, amountWei, encryptedPrivateKey, network, gasPrice, f
   var pk = (await decryptStr(encryptedPrivateKey)).trim();
   if (!pk.startsWith('0x')) pk = '0x' + pk;
 
-  var provider = new ethers.JsonRpcProvider(cfg.rpcUrl);
-  var wallet   = new ethers.Wallet(pk, provider);
-  var contract = new ethers.Contract(cfg.usdtAddress, ERC20_ABI, wallet);
+  var rpcs = [cfg.rpcUrl].concat(cfg.rpcFallbacks || []);
+  var lastErr = null;
 
-  try {
-    if (feeCurrency && network === 'CELO') {
-      // === CIP-64: Transaction Type 123 (0x7b) ===
-      // Format BENAR dari dokumentasi resmi CELO:
-      // 0x7b || RLP([chainId, nonce, maxPriorityFeePerGas, maxFeePerGas, gasLimit,
-      //              to, value, data, accessList, feeCurrency,
-      //              signatureYParity, signatureR, signatureS])
-      // CATATAN: feeCurrency ada di AKHIR setelah accessList, bukan di tengah!
+  for (var rpcIdx = 0; rpcIdx < rpcs.length; rpcIdx++) {
+    var provider = null;
+    var wallet   = null;
+    var contract = null;
+    try {
+      provider = new ethers.JsonRpcProvider(rpcs[rpcIdx]);
+      wallet   = new ethers.Wallet(pk, provider);
+      contract = new ethers.Contract(cfg.usdtAddress, ERC20_ABI, wallet);
 
-      var populated = await contract.transfer.populateTransaction(to, BigInt(amountWei));
+      if (feeCurrency && network === 'CELO') {
+        // === CIP-64: Transaction Type 123 (0x7b) ===
+        // Format BENAR dari dokumentasi resmi CELO:
+        // 0x7b || RLP([chainId, nonce, maxPriorityFeePerGas, maxFeePerGas, gasLimit,
+        //              to, value, data, accessList, feeCurrency,
+        //              signatureYParity, signatureR, signatureS])
+        // CATATAN: feeCurrency ada di AKHIR setelah accessList, bukan di tengah!
 
-      var nonce = await provider.getTransactionCount(wallet.address, 'pending');
+        var populated = await contract.transfer.populateTransaction(to, BigInt(amountWei));
+        var nonce = await provider.getTransactionCount(wallet.address, 'pending');
 
-      // Selalu ambil gasPrice fresh saat kirim — nilai dry-run bisa stale (harga gas berubah)
-      var gpCip64;
-      try {
-        var gpHex = await provider.send('eth_gasPrice', [feeCurrency]);
-        gpCip64 = BigInt(gpHex);
-      } catch (e2) {
-        var fd2 = await provider.getFeeData();
-        gpCip64 = fd2.gasPrice || fd2.maxFeePerGas || BigInt(0);
-      }
-      // CIP-64 type 0x7b: maxFee = maxPrio = gasPrice dari adapter
-      // (tidak pakai EIP-1559 split karena CELO L2 masih menggunakan single gasPrice model)
-      var maxFee  = gpCip64;
-      var maxPrio = gpCip64;
+        // Selalu ambil gasPrice fresh saat kirim — nilai dry-run bisa stale (harga gas berubah)
+        var gpCip64;
+        try {
+          var gpHex = await provider.send('eth_gasPrice', [feeCurrency]);
+          gpCip64 = BigInt(gpHex);
+        } catch (e2) {
+          var fd2 = await provider.getFeeData();
+          gpCip64 = fd2.gasPrice || fd2.maxFeePerGas || BigInt(0);
+        }
+        var maxFee  = gpCip64;
+        var maxPrio = gpCip64;
 
-      // eth_estimateGas dengan feeCurrency = estimasi akurat termasuk overhead adapter
-      // PENTING: provider.estimateGas() ethers.js TIDAK meneruskan feeCurrency ke RPC
-      // Harus pakai provider.send('eth_estimateGas') agar field feeCurrency dikirim
-      var gasLimit;
-      try {
-        var gasLimitHex = await provider.send('eth_estimateGas', [{ to: cfg.usdtAddress, data: populated.data, from: wallet.address, feeCurrency: feeCurrency }]);
-        gasLimit = BigInt(gasLimitHex);
-      } catch (e3) {
-        gasLimit = await provider.estimateGas({ to: cfg.usdtAddress, data: populated.data, from: wallet.address });
-      }
-      gasLimit = gasLimit * BigInt(120) / BigInt(100);
+        // eth_estimateGas dengan feeCurrency = estimasi akurat termasuk overhead adapter
+        var gasLimit;
+        try {
+          var gasLimitHex = await provider.send('eth_estimateGas', [{ to: cfg.usdtAddress, data: populated.data, from: wallet.address, feeCurrency: feeCurrency }]);
+          gasLimit = BigInt(gasLimitHex);
+        } catch (e3) {
+          gasLimit = await provider.estimateGas({ to: cfg.usdtAddress, data: populated.data, from: wallet.address });
+        }
+        gasLimit = gasLimit * BigInt(120) / BigInt(100);
 
-      var chainId = BigInt(cfg.chainId);
-      console.debug('[KoinQ] CIP-64 params — nonce:', nonce, 'maxFee:', maxFee.toString(), 'gasLimit:', gasLimit.toString());
+        var chainId = BigInt(cfg.chainId);
 
-      // 1. Signing payload (tanpa signature)
-      var signingPayload = rlpEncodeList([
-        chainId,          // BigInt
-        nonce,            // number → BigInt via rlpEncodeInt
-        maxPrio,          // BigInt
-        maxFee,           // BigInt
-        gasLimit,         // BigInt
-        cfg.usdtAddress,  // to: hex string (kontrak USDT)
-        '0x',             // value = 0 CELO → empty bytes
-        populated.data,   // calldata
-        [],               // accessList = empty list
-        feeCurrency       // adapter address — TERAKHIR setelah accessList
-      ]);
+        // 1. Signing payload (tanpa signature)
+        var signingPayload = rlpEncodeList([
+          chainId, nonce, maxPrio, maxFee, gasLimit,
+          cfg.usdtAddress, '0x', populated.data, [], feeCurrency
+        ]);
 
-      // 2. Prefix type 0x7b
-      var typedPayload = new Uint8Array(1 + signingPayload.length);
-      typedPayload[0] = 0x7b;
-      typedPayload.set(signingPayload, 1);
+        // 2. Prefix type 0x7b
+        var typedPayload = new Uint8Array(1 + signingPayload.length);
+        typedPayload[0] = 0x7b;
+        typedPayload.set(signingPayload, 1);
 
-      // 3. keccak256 digest
-      var digestHex = ethers.keccak256(typedPayload);
-      console.debug('[KoinQ] CIP-64 digest:', digestHex);
+        // 3. keccak256 digest
+        var digestHex = ethers.keccak256(typedPayload);
 
-      // 4. Sign
-      var sig = await ecSign(digestHex, pk);
-      // ethers v6 Signature memiliki .yParity (0 atau 1) dan .v (27/28)
-      // Gunakan yParity langsung jika tersedia, fallback ke v
-      var yParity = (sig.yParity !== undefined) ? sig.yParity : ((sig.v === 27 || sig.v === 0) ? 0 : 1);
-      console.debug('[KoinQ] CIP-64 sig v:', sig.v, 'yParity:', yParity, 'r:', sig.r.slice(0,10), 's:', sig.s.slice(0,10));
+        // 4. Sign
+        var sig = await ecSign(digestHex, pk);
+        var yParity = (sig.yParity !== undefined) ? sig.yParity : ((sig.v === 27 || sig.v === 0) ? 0 : 1);
 
-      // 5. Encode tx final dengan signature
-      // yParity: RLP integer (BigInt) — 0 → 0x80 (RLP empty/zero), 1 → 0x01
-      // r, s: RLP integer, strip leading zeros (sesuai RLP spec)
-      var yParityEncoded = rlpEncodeInt(yParity);
-      console.debug('[KoinQ] CIP-64 calldata len:', populated.data ? populated.data.length : 'undefined');
-      console.debug('[KoinQ] CIP-64 calldata prefix:', populated.data ? populated.data.slice(0, 10) : 'n/a');
+        // 5. Encode tx final dengan signature
+        var listItems = [
+          chainId, nonce, maxPrio, maxFee, gasLimit,
+          cfg.usdtAddress, '0x', populated.data, [], feeCurrency
+        ];
+        var baseItems = listItems.map(rlpEncodeItem);
+        baseItems.push(rlpEncodeInt(yParity));
+        baseItems.push(rlpEncodeScalar(sig.r));
+        baseItems.push(rlpEncodeScalar(sig.s));
+        var rlpTotal = baseItems.reduce(function(s, e) { return s + e.length; }, 0);
+        var rlpPrefix;
+        if (rlpTotal <= 55) {
+          rlpPrefix = new Uint8Array([0xc0 + rlpTotal]);
+        } else {
+          var rlpLenHex = rlpTotal.toString(16);
+          if (rlpLenHex.length % 2) rlpLenHex = '0' + rlpLenHex;
+          var rlpLenBytes = new Uint8Array(rlpLenHex.match(/.{2}/g).map(function(b) { return parseInt(b, 16); }));
+          rlpPrefix = new Uint8Array([0xf7 + rlpLenBytes.length].concat(Array.from(rlpLenBytes)));
+        }
+        var txPayload = new Uint8Array(rlpPrefix.length + rlpTotal);
+        txPayload.set(rlpPrefix);
+        var off = rlpPrefix.length;
+        baseItems.forEach(function(e) { txPayload.set(e, off); off += e.length; });
 
-      // Encode manual tiap field signature lalu concat ke list
-      var listItems = [
-        chainId,
-        nonce,
-        maxPrio,
-        maxFee,
-        gasLimit,
-        cfg.usdtAddress,  // to
-        '0x',             // value = 0
-        populated.data,
-        [],               // accessList
-        feeCurrency       // adapter — setelah accessList
-      ];
+        var finalTx = new Uint8Array(1 + txPayload.length);
+        finalTx[0] = 0x7b;
+        finalTx.set(txPayload, 1);
 
-      // Encode semua item kecuali sig
-      var encodedItems = listItems.map(rlpEncodeItem);
-      // Tambahkan yParity, r, s
-      encodedItems.push(yParityEncoded);
-      encodedItems.push(rlpEncodeScalar(sig.r));
-      encodedItems.push(rlpEncodeScalar(sig.s));
+        var txHash = await provider.send('eth_sendRawTransaction', [bytesToHex(finalTx)]);
+        return { hash: txHash };
+      } // end CIP-64 CELO
 
-      // Buat list dari encoded items
-      var total = encodedItems.reduce(function(s, e) { return s + e.length; }, 0);
-      var listPrefix;
-      if (total <= 55) {
-        listPrefix = new Uint8Array([0xc0 + total]);
-      } else {
-        var lenHex2 = total.toString(16);
-        if (lenHex2.length % 2) lenHex2 = '0' + lenHex2;
-        var lenBytes2 = new Uint8Array(lenHex2.match(/.{2}/g).map(function(b) { return parseInt(b, 16); }));
-        listPrefix = new Uint8Array([0xf7 + lenBytes2.length].concat(Array.from(lenBytes2)));
-      }
-      var txPayload = new Uint8Array(listPrefix.length + total);
-      txPayload.set(listPrefix);
-      var off = listPrefix.length;
-      encodedItems.forEach(function(e) { txPayload.set(e, off); off += e.length; });
-
-      var finalTx = new Uint8Array(1 + txPayload.length);
-      finalTx[0] = 0x7b;
-      finalTx.set(txPayload, 1);
-
-      var rawHex = bytesToHex(finalTx);
-      console.debug('[KoinQ] CIP-64 rawTx length:', rawHex.length, 'hex (first 100):', rawHex.slice(0, 100));
-      console.debug('[KoinQ] CIP-64 rawTx full:', rawHex);
-
-      var txHash = await provider.send('eth_sendRawTransaction', [rawHex]);
-      console.debug('[KoinQ] CIP-64 txHash:', txHash);
-      return { hash: txHash };
+      // BSC / CELO tanpa CIP-64 — gasPrice selalu fresh dari network agar tx tidak stuck
+      var feeDataLive = await provider.getFeeData();
+      var liveFee = feeDataLive.gasPrice || feeDataLive.maxFeePerGas || BigInt(0);
+      var overrides = { gasPrice: liveFee };
+      var txResp = await contract.transfer(to, BigInt(amountWei), overrides);
+      return txResp;
+    } catch (e) {
+      lastErr = e;
+      console.warn('[KoinQ] sendUSDT failed for RPC', rpcs[rpcIdx], e && e.message);
+    } finally {
+      provider = null;
+      wallet   = null;
+      contract = null;
     }
-
-    // BSC / CELO tanpa CIP-64 — gasPrice selalu fresh dari network agar tx tidak stuck
-    var feeDataLive = await provider.getFeeData();
-    var liveFee = feeDataLive.gasPrice || feeDataLive.maxFeePerGas || BigInt(0);
-    var overrides = { gasPrice: liveFee };
-    var txResp = await contract.transfer(to, BigInt(amountWei), overrides);
-    return txResp;
-  } catch (e) {
-    console.warn('[KoinQ] sendUSDT failed', e && e.message);
-    throw e;
   }
+
+  pk = null;
+  throw lastErr || new Error('Send failed: all RPC endpoints exhausted');
 }
 
 // Fallback: use RPC getLogs to find ERC-20 Transfer events for an address (no API key required)
@@ -647,71 +627,66 @@ async function fetchTransactionsByLogs(address, network) {
   var cfg = networks[network];
   var rpcs = [cfg.rpcUrl].concat(cfg.rpcFallbacks || []);
   var transferTopic = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
-  var results = [];
 
   for (var i = 0; i < rpcs.length; i++) {
     try {
       var provider = new ethers.JsonRpcProvider(rpcs[i]);
       var latest = await provider.getBlockNumber();
-      var fromBlock = Math.max(0, latest - 50000); // search last ~50k blocks (configurable)
+      // Gunakan range 5000 blok agar tidak kena limit node publik BSC (max 5000)
+      // CELO node lebih toleran tapi tetap pakai 5000 untuk konsistensi
+      var BLOCK_RANGE = 5000;
+      var fromBlock = Math.max(0, latest - BLOCK_RANGE);
 
-      // Prepare padded topic for address matching (topics[1]=from, topics[2]=to)
       var addrNo0x = address.toLowerCase().replace(/^0x/, '');
       var addrTopic = '0x' + addrNo0x.padStart(64, '0');
 
-      // Do NOT hardcode a token contract. Fetch logs across all contracts by omitting `address`.
-      var toFilter = {
-        fromBlock: fromBlock,
-        toBlock: latest,
-        topics: [transferTopic, null, addrTopic]
-      };
-      var fromFilter = {
-        fromBlock: fromBlock,
-        toBlock: latest,
-        topics: [transferTopic, addrTopic]
-      };
+      var toFilter   = { fromBlock: fromBlock, toBlock: latest, topics: [transferTopic, null, addrTopic] };
+      var fromFilter = { fromBlock: fromBlock, toBlock: latest, topics: [transferTopic, addrTopic] };
 
-      var toLogs = await provider.getLogs(toFilter);
+      var toLogs   = await provider.getLogs(toFilter);
       var fromLogs = await provider.getLogs(fromFilter);
-
       var all = toLogs.concat(fromLogs);
 
-      // Collect unique contract addresses to query decimals/symbol later
+      // Batch: kumpulkan block numbers unik, lalu fetch sekali per block (bukan per log)
+      var blockNums = {};
+      all.forEach(function(lg) { blockNums[lg.blockNumber] = true; });
+      var blockCache = {};
+      await Promise.all(Object.keys(blockNums).map(function(bn) {
+        return provider.getBlock(Number(bn)).then(function(blk) {
+          if (blk) blockCache[bn] = blk.timestamp;
+        }).catch(function() {});
+      }));
+
+      // Batch: metadata kontrak unik
       var contracts = {};
       all.forEach(function(lg) { contracts[lg.address.toLowerCase()] = true; });
       var contractMeta = {};
-      var contractAddrs = Object.keys(contracts);
-      for (var k = 0; k < contractAddrs.length; k++) {
-        var caddr = contractAddrs[k];
-        try {
-          var ctr = new ethers.Contract(caddr, ERC20_ABI, provider);
-          var dec = await ctr.decimals();
-          var sym = await ctr.symbol();
-          contractMeta[caddr] = { decimals: dec !== undefined ? Number(dec) : null, symbol: sym || null };
-        } catch (e) {
+      await Promise.all(Object.keys(contracts).map(function(caddr) {
+        var ctr = new ethers.Contract(caddr, ERC20_ABI, provider);
+        return Promise.all([ctr.decimals(), ctr.symbol()]).then(function(res) {
+          contractMeta[caddr] = { decimals: res[0] !== undefined ? Number(res[0]) : null, symbol: res[1] || null };
+        }).catch(function() {
           contractMeta[caddr] = { decimals: null, symbol: null };
-        }
-      }
+        });
+      }));
 
-      // Deduplicate by txHash+logIndex and build results
+      // Deduplicate dan build results
       var seen = {};
+      var results = [];
       for (var j = 0; j < all.length; j++) {
         var lg = all[j];
-        var key = lg.transactionHash + '_' + lg.logIndex;
+        // Transfer(address,address,uint256) harus punya tepat 3 topics
+        // Skip log yang topic-nya tidak lengkap (bisa event lain yang bukan Transfer)
+        if (!lg.topics || lg.topics.length < 3) continue;
+        var key = lg.transactionHash + '_' + (lg.logIndex != null ? lg.logIndex : j);
         if (seen[key]) continue;
         seen[key] = true;
 
-        // Parse topics: topics[1]=from, topics[2]=to
-        var fromAddr = '0x' + (lg.topics[1] || '').slice(-40);
-        var toAddr = '0x' + (lg.topics[2] || '').slice(-40);
-        var value = lg.data || '0x0';
-
-        // Fetch block timestamp
-        var blk = await provider.getBlock(lg.blockNumber);
-        var ts = blk && blk.timestamp ? String(blk.timestamp) : String(Date.now() / 1000 | 0);
-
-        var caddrLower = lg.address.toLowerCase();
-        var meta = contractMeta[caddrLower] || { decimals: null, symbol: null };
+        var fromAddr = '0x' + lg.topics[1].slice(-40);
+        var toAddr   = '0x' + lg.topics[2].slice(-40);
+        var value    = lg.data || '0x0';
+        var ts = blockCache[lg.blockNumber] ? String(blockCache[lg.blockNumber]) : String(Date.now() / 1000 | 0);
+        var meta = contractMeta[lg.address.toLowerCase()] || { decimals: null, symbol: null };
 
         results.push({
           hash: lg.transactionHash,
@@ -725,12 +700,10 @@ async function fetchTransactionsByLogs(address, network) {
         });
       }
 
-      // Sort by block desc
-      results.sort(function(a,b){ return (b.timeStamp || 0) - (a.timeStamp || 0); });
+      results.sort(function(a, b) { return (b.timeStamp || 0) - (a.timeStamp || 0); });
       return results.map(normaliseTx);
     } catch (e) {
       console.warn('[KoinQ] getLogs fallback failed for RPC', rpcs[i], e && e.message);
-      // try next RPC
     }
   }
   return [];
@@ -744,12 +717,10 @@ async function fetchTransactions(address, network) {
     try {
       var mmUrl = 'https://accounts.api.cx.metamask.io/v1/accounts/' + encodeURIComponent(address) +
                   '/transactions?networks=0x1,0x89,0x38,0xe708,0x2105,0xa,0xa4b1,0x82750,0x531,0x8f&sortDirection=DESC';
-      console.debug('[KoinQ] Querying MetaMask Accounts API:', mmUrl);
       var mmRes = await fetch(mmUrl, { mode: 'cors', credentials: 'omit' });
       if (mmRes.ok) {
         var mmData = await mmRes.json();
         if (mmData && Array.isArray(mmData.data) && mmData.data.length > 0) {
-          console.debug('[KoinQ] MetaMask accounts API returned', mmData.data.length, 'txs');
           return mmData.data.map(normaliseExplorerTx);
         }
       }
@@ -766,11 +737,9 @@ async function fetchTransactions(address, network) {
       var blockscoutUrl = 'https://celo.blockscout.com/api?module=account&action=tokentx' +
                           '&address=' + encodeURIComponent(address) +
                           '&page=1&offset=20&sort=desc';
-      console.debug('[KoinQ] Attempting Blockscout tokentx:', blockscoutUrl);
       var res = await fetch(blockscoutUrl, { mode: 'cors', credentials: 'omit' });
       if (res.ok) {
         var data = await res.json();
-        console.debug('[KoinQ] Blockscout response:', data && data.result && data.result.length);
         if (Array.isArray(data.result) && data.result.length > 0) {
           return data.result.map(normaliseTx);
         }
@@ -802,12 +771,11 @@ async function fetchTransactions(address, network) {
   } catch (e) {
     console.warn('Explorer API failed for ' + network + ':', e && e.message);
     // If BSC explorer deprecated (NOTOK) or failed, try RPC getLogs fallback (no API key)
-    if (network === 'BSC') {
-      try {
-        return await fetchTransactionsByLogs(address, network);
-      } catch (err) {
-        console.warn('[KoinQ] getLogs fallback also failed:', err && err.message);
-      }
+    // Fallback getLogs berlaku untuk semua network (BSC maupun CELO)
+    try {
+      return await fetchTransactionsByLogs(address, network);
+    } catch (err) {
+      console.warn('[KoinQ] getLogs fallback also failed:', err && err.message);
     }
     return [];
   }
@@ -853,6 +821,7 @@ function formatAmount(val) {
 
 function timeAgo(ts) {
   var diff = Math.floor(Date.now() / 1000) - parseInt(ts);
+  if (diff < 0) return 'just now';   // clock skew / future timestamp
   if (diff < 60) return diff + 's ago';
   if (diff < 3600) return Math.floor(diff / 60) + 'm ago';
   if (diff < 86400) return Math.floor(diff / 3600) + 'h ago';
@@ -1188,8 +1157,7 @@ function selectWallet(idx) {
   state.currentIndex = idx;
   state.currentAddress = state.wallets[idx].address;
   renderSidebar();
-  showMainPanel(true);
-  renderMainPanel();
+  showMainPanel(true); // sudah memanggil renderMainPanel() di desktop path
   loadAddressData(state.currentAddress);
 }
 
@@ -1202,8 +1170,8 @@ function showMainPanel(show) {
   } else {
     main.classList.add('show');
     main.style.display = 'block';
-    if (show) renderMainPanel();
   }
+  if (show) renderMainPanel();
 }
 
 function renderBalanceGrid(addr) {
@@ -1226,49 +1194,44 @@ function renderBalanceGrid(addr) {
 
   var dotClass = net === 'BSC' ? 'bnb' : 'celo';
 
-  // Build cards safely
+  // Smart update: jika network sama dan elemen sudah ada, cukup update textContent
+  // Hindari full DOM rebuild yang menyebabkan flicker setiap balance update
+  var existingNative = $('balance-native');
+  var existingUsdt   = $('balance-usdt');
+  if (existingNative && existingUsdt && grid.dataset.net === net) {
+    existingNative.textContent = nativeBal;
+    existingUsdt.textContent   = usdtBal;
+    return;
+  }
+
+  // Full rebuild: network berbeda atau pertama kali render
+  grid.dataset.net = net;
   grid.innerHTML = '';
 
-  var card1 = document.createElement('div');
-  card1.className = 'balance-card';
-  var label1 = document.createElement('div');
-  label1.className = 'chain-label';
-  var dot1 = document.createElement('span');
-  dot1.className = 'chain-dot ' + dotClass;
-  label1.appendChild(dot1);
-  label1.appendChild(document.createTextNode(' ' + cfg.name));
-  var amt1 = document.createElement('div');
-  amt1.className = 'balance-amount';
-  amt1.id = 'balance-native';
-  amt1.textContent = nativeBal;
-  var sym1 = document.createElement('div');
-  sym1.className = 'balance-symbol';
-  sym1.textContent = cfg.symbol;
-  card1.appendChild(label1);
-  card1.appendChild(amt1);
-  card1.appendChild(sym1);
+  function makeCard(dotCls, labelText, amtId, amtTxt, symTxt) {
+    var card = document.createElement('div');
+    card.className = 'balance-card';
+    var lbl = document.createElement('div');
+    lbl.className = 'chain-label';
+    var dot = document.createElement('span');
+    dot.className = 'chain-dot ' + dotCls;
+    lbl.appendChild(dot);
+    lbl.appendChild(document.createTextNode(' ' + labelText));
+    var amt = document.createElement('div');
+    amt.className = 'balance-amount';
+    amt.id = amtId;
+    amt.textContent = amtTxt;
+    var sym = document.createElement('div');
+    sym.className = 'balance-symbol';
+    sym.textContent = symTxt;
+    card.appendChild(lbl);
+    card.appendChild(amt);
+    card.appendChild(sym);
+    return card;
+  }
 
-  var card2 = document.createElement('div');
-  card2.className = 'balance-card';
-  var label2 = document.createElement('div');
-  label2.className = 'chain-label';
-  var dot2 = document.createElement('span');
-  dot2.className = 'chain-dot usdt';
-  label2.appendChild(dot2);
-  label2.appendChild(document.createTextNode(' Tether USD'));
-  var amt2 = document.createElement('div');
-  amt2.className = 'balance-amount';
-  amt2.id = 'balance-usdt';
-  amt2.textContent = usdtBal;
-  var sym2 = document.createElement('div');
-  sym2.className = 'balance-symbol';
-  sym2.textContent = 'USDT';
-  card2.appendChild(label2);
-  card2.appendChild(amt2);
-  card2.appendChild(sym2);
-
-  grid.appendChild(card1);
-  grid.appendChild(card2);
+  grid.appendChild(makeCard(dotClass, cfg.name, 'balance-native', nativeBal, cfg.symbol));
+  grid.appendChild(makeCard('usdt', 'Tether USD', 'balance-usdt', usdtBal, 'USDT'));
 }
 
 function renderMainPanel() {
@@ -1341,6 +1304,9 @@ function renderTransactions() {
     }
     var amountFmt = formatAmount(displayAmountRaw);
     var explorerUrl = networks[net].explorerTx + tx.hash;
+    var hashDisplay = tx.hash
+      ? tx.hash.slice(0, 8) + '\u2026' + tx.hash.slice(-6)
+      : '(unknown)';
 
     var row = document.createElement('div');
     row.className = 'tx-row' + (tx.isError === '1' ? ' tx-error' : '');
@@ -1353,8 +1319,8 @@ function renderTransactions() {
     hashLink.target = '_blank';
     hashLink.rel = 'noopener noreferrer';
     hashLink.className = 'tx-hash-link';
-    hashLink.textContent = tx.hash.slice(0, 8) + '…' + tx.hash.slice(-6);
-    hashLink.title = tx.hash;
+    hashLink.textContent = hashDisplay;
+    hashLink.title = tx.hash || '(unknown hash)';
     cellHash.appendChild(hashLink);
 
     // From
@@ -1410,8 +1376,16 @@ function renderTransactions() {
 
 /* ===== Load Data ===== */
 async function loadAddressData(address) {
-  loadBalances(address);
-  loadTransactions(address);
+  // Jika address sudah tidak aktif saat ini (user sudah ganti wallet), batalkan
+  if (address !== state.currentAddress) return;
+  // Jalankan parallel: balance dan tx tidak saling blokir, tapi masing-masing di-await
+  // agar state.balLoading / state.txLoading tidak corrupt oleh concurrent calls
+  Promise.all([
+    loadBalances(address),
+    loadTransactions(address)
+  ]).catch(function(e) {
+    console.warn('[KoinQ] loadAddressData error:', e && e.message);
+  });
 }
 
 // Fetch native + USDT balance untuk network aktif saja (efisien, tidak fetch semua network)
@@ -1427,6 +1401,12 @@ async function loadBalances(address) {
     fetchBalance(address, net),
     fetchUSDTBalance(address, net)
   ]);
+
+  // Guard: jika user sudah ganti wallet selama fetch, buang hasil stale
+  if (address !== state.currentAddress || net !== state.network) {
+    state.balLoading = false;
+    return;
+  }
 
   if (net === 'BSC') {
     state.balanceBSC[address] = results[0];
@@ -1447,7 +1427,19 @@ async function loadTransactions(address) {
   state.transactions = [];
   renderTransactions();
 
-  var txs = await fetchTransactions(address, state.network);
+  var net = state.network; // capture sebelum await agar stale-guard bisa cek network juga
+  var txs;
+  try {
+    txs = await fetchTransactions(address, net);
+  } catch (e) {
+    console.warn('[KoinQ] fetchTransactions unexpected error:', e && e.message);
+    txs = [];
+  }
+  // Guard: jika user sudah ganti wallet ATAU network selama fetch, buang hasil stale
+  if (address !== state.currentAddress || net !== state.network) {
+    state.txLoading = false;
+    return;
+  }
   // null = API error, [] = no txs found, array = results
   if (Array.isArray(txs)) {
     txs.sort(function(a, b) { return (Number(b.timeStamp) || 0) - (Number(a.timeStamp) || 0); });
@@ -1472,34 +1464,42 @@ function setupNetworkSwitcher() {
       state.network = this.dataset.net;
       updateNetworkUI();
       state.transactions = [];
-      if (state.currentAddress) {
-        renderMainPanel();
-        // Reload USDT balance for new network and transactions
-        var addr = state.currentAddress;
-        var net = state.network;
-        var usdtKey = addr + '_' + net;
-        if (state.balanceUSDT[usdtKey] === undefined) {
-          state.balLoading = true;
-          renderBalanceGrid(addr);
-          fetchUSDTBalance(addr, net).then(function(bal) {
-            state.balanceUSDT[usdtKey] = bal;
-            state.balLoading = false;
-            if (state.currentAddress === addr) renderBalanceGrid(addr);
-          });
-        }
-        // Fetch native balance untuk network aktif jika belum ada
-        var nativeMissing = net === 'BSC'
-          ? isNaN(parseFloat(state.balanceBSC[addr]))
-          : isNaN(parseFloat(state.balanceCELO[addr]));
-        if (nativeMissing) {
-          fetchBalance(addr, net).then(function(bal) {
-            if (net === 'BSC') state.balanceBSC[addr] = bal;
-            else state.balanceCELO[addr] = bal;
-            if (state.currentAddress === addr && state.network === net) renderBalanceGrid(addr);
-          });
-        }
-        loadTransactions(addr);
+      if (!state.currentAddress) return;
+
+      renderMainPanel();
+
+      // Capture addr+net sekarang agar closure .then() tidak stale
+      var addr = state.currentAddress;
+      var net  = state.network;
+      var usdtKey = addr + '_' + net;
+
+      // Fetch USDT jika belum ada untuk network ini
+      if (state.balanceUSDT[usdtKey] === undefined) {
+        state.balLoading = true;
+        renderBalanceGrid(addr);
+        fetchUSDTBalance(addr, net).then(function(bal) {
+          state.balanceUSDT[usdtKey] = bal;
+          state.balLoading = false;
+          if (state.currentAddress === addr && state.network === net) renderBalanceGrid(addr);
+        }).catch(function(e) {
+          state.balLoading = false;
+          console.warn('[KoinQ] fetchUSDTBalance (network switch) failed:', e && e.message);
+        });
       }
+
+      // Fetch native balance jika belum ada untuk network ini
+      var nativeCache = net === 'BSC' ? state.balanceBSC[addr] : state.balanceCELO[addr];
+      if (nativeCache === undefined || isNaN(parseFloat(nativeCache))) {
+        fetchBalance(addr, net).then(function(bal) {
+          if (net === 'BSC') state.balanceBSC[addr] = bal;
+          else state.balanceCELO[addr] = bal;
+          if (state.currentAddress === addr && state.network === net) renderBalanceGrid(addr);
+        }).catch(function(e) {
+          console.warn('[KoinQ] fetchBalance (network switch) failed:', e && e.message);
+        });
+      }
+
+      loadTransactions(addr);
     });
   });
 }
@@ -1598,7 +1598,14 @@ function setupSendModal() {
     statusEl.classList.remove('hidden');
 
     try {
-      var est = await estimateUSDTTransfer(to, amount, wallet.address, net);
+      // Timeout 30 detik untuk dry-run agar tidak hang jika RPC lambat
+      var estPromise = estimateUSDTTransfer(to, amount, wallet.address, net);
+      var dryRunTimer;
+      var timeoutPromise = new Promise(function(_, reject) {
+        dryRunTimer = setTimeout(function() { reject(new Error('Request timed out. Check your connection.')); }, 30000);
+      });
+      var est = await Promise.race([estPromise, timeoutPromise]);
+      clearTimeout(dryRunTimer);
       pendingTx = est;
 
       // Build dry run preview
@@ -1656,7 +1663,9 @@ function setupSendModal() {
       showStep('preview');
       statusEl.classList.add('hidden');
     } catch (err) {
-      var msg = err.reason || 'Simulation failed. Check balance or address.';
+      var msg = (typeof err.reason === 'string' ? err.reason : null) ||
+                (typeof err.message === 'string' ? err.message : null) ||
+                'Simulation failed. Check balance or address.';
       setStatus(statusEl, 'error', '✗ ' + msg.slice(0, 120));
     }
 
@@ -1677,15 +1686,18 @@ function setupSendModal() {
 
     try {
       // Teruskan feeCurrency jika ada (CELO CIP-64 — gas dipotong dari USDT)
-      var tx = await sendUSDT(pendingTx.to, pendingTx.amountWei, wallet.encryptedPrivateKey, pendingTx.network, pendingTx.gasPrice, pendingTx.feeCurrency || null);
-      setStatus(statusPreview, 'success', '✓ Sent! TX: ' + tx.hash.slice(0, 18) + '…');
+      var tx = await sendUSDT(pendingTx.to, pendingTx.amountWei, wallet.encryptedPrivateKey, pendingTx.network, pendingTx.feeCurrency || null);
+      var txHashStr = (tx && tx.hash) ? tx.hash : '(unknown)';
+      setStatus(statusPreview, 'success', '✓ Sent! TX: ' + txHashStr.slice(0, 18) + '…');
       showToast('USDT sent successfully!', 'success');
       setTimeout(function() {
         closeModal();
         loadAddressData(state.currentAddress);
       }, 2500);
     } catch (err) {
-      var msg = err.reason || 'Transaction failed. Check your USDT and gas balance.';
+      var msg = (typeof err.reason === 'string' ? err.reason : null) ||
+                (typeof err.message === 'string' ? err.message : null) ||
+                'Transaction failed. Check your USDT and gas balance.';
       setStatus(statusPreview, 'error', '✗ ' + msg.slice(0, 120));
     }
 
@@ -1715,11 +1727,15 @@ function setupLogout() {
     // Clear sensitive state
     state.encryptedMnemonic = null;
     state.wallets           = [];
+    state.currentIndex      = 0;
     state.currentAddress    = '';
+    state.network           = 'BSC';
     state.transactions      = [];
     state.balanceBSC        = {};
     state.balanceCELO       = {};
     state.balanceUSDT       = {};
+    state.balLoading        = false;
+    state.txLoading         = false;
     sessionEncKey           = null;
 
     // Reset login UI
@@ -1761,18 +1777,34 @@ function setupRefresh() {
 }
 
 /* ===== Add Wallet ===== */
+var MAX_WALLETS = 20;
+
 async function addWallet() {
+  if (state.wallets.length >= MAX_WALLETS) {
+    showToast('Maximum ' + MAX_WALLETS + ' accounts reached.', 'error');
+    return;
+  }
   var nextIndex = state.wallets.length;
-  var mnemonic = await decryptStr(state.encryptedMnemonic);
-  var newWallet = getHDWallet(mnemonic, nextIndex);
-  mnemonic = null;
-  state.wallets.push({
-    address: newWallet.address,
-    encryptedPrivateKey: await encryptStr(newWallet.privateKey)
-  });
-  newWallet.privateKey = null;
-  renderSidebar();
-  showToast('Account ' + nextIndex + ' added', 'success');
+  var mnemonic = null;
+  var newWallet = null;
+  try {
+    mnemonic = await decryptStr(state.encryptedMnemonic);
+    newWallet = getHDWallet(mnemonic, nextIndex);
+    mnemonic = null; // clear segera setelah dipakai
+    state.wallets.push({
+      address: newWallet.address,
+      encryptedPrivateKey: await encryptStr(newWallet.privateKey)
+    });
+    showToast('Account ' + nextIndex + ' added', 'success');
+    // Auto-select wallet baru agar langsung bisa digunakan
+    selectWallet(nextIndex);
+  } catch (e) {
+    console.warn('[KoinQ] addWallet error:', e && e.message);
+    showToast('Failed to add account. Please re-login.', 'error');
+  } finally {
+    mnemonic  = null; // pastikan selalu di-clear meski error di atas
+    newWallet = null; // clear seluruh object agar GC dapat bebaskan referensi privateKey
+  }
 }
 
 function setupAddWallet() {
@@ -1832,34 +1864,36 @@ function setupPhraseModal() {
       setStatus(statusEl, 'error', '✗ Please enter your password.');
       return;
     }
+    if (pwd.length < 6) {
+      setStatus(statusEl, 'error', '✗ Password must be at least 6 characters.');
+      return;
+    }
 
     confirmBtn.disabled = true;
     confirmBtn.textContent = '';
     confirmBtn.appendChild(makeSpinner());
     confirmBtn.appendChild(document.createTextNode(' Verifying…'));
 
+    var storedMnemonic = null;
     try {
-      // Verify by re-deriving the session key from the password and checking
-      // if we can successfully decrypt the stored mnemonic with it.
-      // We use PBKDF2 to derive a test key and verify it matches sessionEncKey
-      // by attempting to decrypt — if decrypt succeeds, password is correct.
-      // Since the actual key also includes the file hash (baked into sessionEncKey),
-      // we just try to decrypt the stored mnemonic with the current session key.
-      var storedMnemonic = await decryptStr(state.encryptedMnemonic);
+      if (!sessionEncKey) {
+        setStatus(statusEl, 'error', '✗ Session expired. Please re-login.');
+        return;
+      }
+      storedMnemonic = await decryptStr(state.encryptedMnemonic);
 
-      // As a secondary check, verify the password prefix matches by re-deriving
-      // from just the password and checking it hashes to expected prefix.
-      // Simple approach: just trust the decrypt succeeded (AES-GCM provides authentication).
-      navigator.clipboard.writeText(storedMnemonic).then(function() {
-        setStatus(statusEl, 'success', '✓ Recovery phrase copied to clipboard!');
-        showToast('Recovery phrase copied to clipboard', 'success');
-        setTimeout(closeModal, 2000);
-      }).catch(function() {
-        setStatus(statusEl, 'error', '✗ Clipboard access denied. Please allow clipboard permissions.');
-      });
+      await navigator.clipboard.writeText(storedMnemonic);
+      setStatus(statusEl, 'success', '✓ Recovery phrase copied to clipboard!');
+      showToast('Recovery phrase copied to clipboard', 'success');
+      setTimeout(closeModal, 2000);
     } catch (err) {
-      setStatus(statusEl, 'error', '✗ Error accessing recovery phrase. Please re-login.');
+      if (err && err.name === 'NotAllowedError') {
+        setStatus(statusEl, 'error', '✗ Clipboard access denied. Please allow clipboard permissions.');
+      } else {
+        setStatus(statusEl, 'error', '✗ Error accessing recovery phrase. Please re-login.');
+      }
     } finally {
+      storedMnemonic = null; // clear dari memory segera
       confirmBtn.disabled = false;
       confirmBtn.textContent = '📋 Copy Phrase to Clipboard';
     }
